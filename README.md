@@ -401,3 +401,110 @@ snapshot is not available.
 ```
 
 For a tied match, send an empty `winnerTeamId` or `winnerTeamName: "Tied"`.
+
+## Stats API
+
+### Get Platform Stats
+
+`GET /api/v1/stats`
+
+No authentication required. Returns the total number of registered users and
+the number of currently connected (active) users, based on live Socket.IO
+connections.
+
+```json
+{
+  "totalUsers": 1240,
+  "activeUsers": 37
+}
+```
+
+The backend also broadcasts `ACTIVE_USERS_COUNT` over the existing Socket.IO
+connection whenever a client connects or disconnects, so clients already
+listening for live updates can update the active-user count without polling:
+
+```json
+{
+  "count": 37
+}
+```
+
+## Analytics API
+
+Lightweight, self-hosted daily tracking: page views, signups/logins, tournament
+creation, and match start/completion, all stored in MongoDB (no third-party
+analytics service).
+
+### Track Event
+
+`POST /api/v1/analytics/track`
+
+No authentication required (works for anonymous visitors); if an
+`Authorization: Bearer <token>` header is present, the event is attributed to
+that user.
+
+```json
+{
+  "type": "PAGE_VIEW",
+  "path": "/tournaments",
+  "sessionId": "client-generated-anon-id"
+}
+```
+
+Supported `type` values: `PAGE_VIEW`, `USER_SIGNUP`, `USER_LOGIN`,
+`TOURNAMENT_CREATED`, `MATCH_STARTED`, `MATCH_COMPLETED`. The last five are
+also recorded automatically server-side (signup/login, tournament creation,
+match start/complete), so the frontend only needs to call this for
+`PAGE_VIEW`.
+
+### Daily Stats
+
+`GET /api/v1/analytics/daily?days=30`
+
+Admin only (`Authorization: Bearer <token>` for an allowlisted account, see
+`ANALYTICS_ADMIN_EMAILS`). Returns one bucket per day for the requested
+range (max 90 days):
+
+```json
+{
+  "days": [
+    {
+      "day": "2026-08-31",
+      "activeUsers": 42,
+      "newSignups": 3,
+      "logins": 18,
+      "tournamentsCreated": 1,
+      "matchesStarted": 5,
+      "matchesCompleted": 4,
+      "pageViews": 130
+    }
+  ]
+}
+```
+
+`activeUsers` counts distinct browser sessions that day, deduped by the
+client-generated `sessionId` (not by user id) -- this stays stable across
+login/logout/signup within the same visit, so one real visitor is never
+counted more than once just because they switched accounts mid-visit.
+
+### Summary Stats
+
+`GET /api/v1/analytics/summary`
+
+Admin only. Returns `today`, `last7Days`, and `last30Days` totals (same
+shape as one daily bucket above) plus `topPages` (the 10 most-viewed paths
+in the last 7 days).
+
+### Admin Access
+
+Only accounts whose email is in `ANALYTICS_ADMIN_EMAILS` (comma-separated
+env var, defaults to `gotimonik@gmail.com`) can call the `daily` and
+`summary` endpoints; everyone else gets `403`.
+
+### Local/Dev Traffic Is Excluded
+
+Every event (including the ones recorded automatically server-side) is
+dropped before it's saved if the request looks local -- its `Origin`,
+`Referer`, or `Host` header is `localhost`/`127.0.0.1`/`::1` (any port). This
+keeps local development and manual API testing out of the real daily
+numbers automatically, with no separate cleanup step needed.

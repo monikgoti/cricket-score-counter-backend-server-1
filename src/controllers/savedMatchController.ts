@@ -9,6 +9,8 @@ import {
 } from "../models/TournamentMatch";
 import { TournamentTeam, type ITournamentTeam } from "../models/TournamentTeam";
 import { completeTournamentMatchFromSavedMatch } from "./tournamentController";
+import { trackEvent } from "../utils/analytics";
+import { parsePagination, buildPaginationMeta } from "../utils/pagination";
 
 const normalizeText = (value: unknown) =>
   typeof value === "string" ? value.trim() : "";
@@ -129,6 +131,7 @@ export const saveMatch = async (
           status,
           resultText,
         },
+        req,
       );
 
       if (!tournamentResult) {
@@ -146,6 +149,8 @@ export const saveMatch = async (
       return;
     }
 
+    const existedBeforeSave = await SavedMatch.exists({ user, clientMatchId });
+
     const match = await SavedMatch.findOneAndUpdate(
       { user, clientMatchId },
       {
@@ -159,6 +164,21 @@ export const saveMatch = async (
       },
       { returnDocument: "after", upsert: true, setDefaultsOnInsert: true },
     );
+
+    if (!existedBeforeSave) {
+      trackEvent(req, {
+        type: "MATCH_STARTED",
+        userId: req.user.id,
+        metadata: { matchId: String(match._id), mode: "saved" },
+      });
+    }
+    if (status === "completed") {
+      trackEvent(req, {
+        type: "MATCH_COMPLETED",
+        userId: req.user.id,
+        metadata: { matchId: String(match._id), mode: "saved" },
+      });
+    }
 
     res.status(200).json({
       match: serializeMatch(match),
@@ -227,7 +247,24 @@ export const getMatches = async (
       ),
     ].sort((a, b) => getMatchSortTime(b) - getMatchSortTime(a));
 
-    res.status(200).json({ matches });
+    // GET /api/v1/matches?page=1&limit=20 -- page/limit are optional; a
+    // caller that doesn't pass them still gets page 1 at the default limit
+    // rather than everything. History is merged from two collections
+    // (SavedMatch + TournamentMatch) and sorted in memory above, so unlike
+    // getTournaments this can't push skip/limit down to Mongo -- both
+    // collections still have to be fetched in full to sort correctly across
+    // them. Pagination here only trims what's sent back to the client.
+    const pagination = parsePagination(req.query as Record<string, unknown>);
+    const total = matches.length;
+    const pageMatches = matches.slice(
+      pagination.skip,
+      pagination.skip + pagination.limit,
+    );
+
+    res.status(200).json({
+      matches: pageMatches,
+      pagination: buildPaginationMeta(total, pagination),
+    });
   } catch (error) {
     console.error("Get matches error", error);
     res.status(500).json({ message: "Unable to load matches" });

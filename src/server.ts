@@ -3,13 +3,17 @@ import express from "express";
 import type { Request, Response } from "express";
 import * as http from "http";
 import { connectDatabase } from "./config/database";
+import analyticsRoutes from "./routes/analyticsRoutes";
 import authRoutes from "./routes/authRoutes";
 import playerRoutes from "./routes/playerRoutes";
 import playerTeamRoutes from "./routes/playerTeamRoutes";
+import promoBannerRoutes from "./routes/promoBannerRoutes";
 import publicPlayerRoutes from "./routes/publicPlayerRoutes";
 import savedMatchRoutes from "./routes/savedMatchRoutes";
+import statsRoutes from "./routes/statsRoutes";
 import tournamentRoutes from "./routes/tournamentRoutes";
 import { SocketIOClientEvents, SocketIOEvents } from "./utils/constant";
+import { setSocketServer } from "./utils/socketState";
 import { Socket, Server as SocketIOServer } from "socket.io";
 
 type GameScorePayload = Record<string, unknown> | string;
@@ -120,6 +124,20 @@ const buildLiveUpdateFromScore = (
     return null;
   }
 
+  // The scorer broadcasts its current snapshot the moment a match's
+  // scoring screen finishes loading (openers picked, ready for ball one) --
+  // not only after each ball -- so the very first broadcast for every
+  // single match is 0/0 (0.0), before a single ball has actually been
+  // bowled. Without this check, that placeholder state (or a match
+  // abandoned right after starting, whose last-known state is still this
+  // same zero snapshot since it never sent another update) sits in
+  // `gameScores` and surfaces on the home page's "live" ticker looking
+  // like an active match, when there's nothing live about it yet.
+  const hasFacedAnyBalls = currentOver > 0 || currentBallOfOver > 0;
+  if (!hasFacedAnyBalls && score === 0 && wickets === 0) {
+    return null;
+  }
+
   const oversText = formatOvers(currentOver, currentBallOfOver);
   const scoreText = `${teamName} ${score}/${wickets} (${oversText})`;
 
@@ -176,6 +194,14 @@ const io = new SocketIOServer(server, {
     origin: "*",
   },
 });
+setSocketServer(io);
+
+const broadcastActiveUsersCount = (): void => {
+  io.emit(
+    SocketIOEvents.ACTIVE_USERS_COUNT,
+    JSON.stringify({ count: io.engine.clientsCount }),
+  );
+};
 
 app.get("/", (req: Request, res: Response) => {
   res.send("Socket.IO server is running!");
@@ -202,12 +228,16 @@ app.use((req: Request, res: Response, next) => {
 app.use("/api/v1/auth", authRoutes);
 app.use("/api/v1/players", playerRoutes);
 app.use("/api/v1/player-teams", playerTeamRoutes);
+app.use("/api/v1/promo-banner", promoBannerRoutes);
 app.use("/api/v1/public-players", publicPlayerRoutes);
 app.use("/api/v1/matches", savedMatchRoutes);
 app.use("/api/v1/tournaments", tournamentRoutes);
+app.use("/api/v1/stats", statsRoutes);
+app.use("/api/v1/analytics", analyticsRoutes);
 
 io.on("connection", (socket: Socket) => {
   socket.id && console.log(`New client connected: ${socket.id}`);
+  broadcastActiveUsersCount();
   // On game join
   socket.on(SocketIOClientEvents.GAME_JOIN, (roomID: string) => {
     socket.join(roomID);
@@ -265,6 +295,7 @@ io.on("connection", (socket: Socket) => {
     }
     gameScoresClient.delete(socket.id);
     console.log(`Client disconnected: ${socket.id}, reason: ${reason}`);
+    broadcastActiveUsersCount();
   });
 });
 

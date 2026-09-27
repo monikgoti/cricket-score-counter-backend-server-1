@@ -3,6 +3,7 @@ import type { Request, Response } from "express";
 import type { AuthenticatedRequest } from "../middleware/authMiddleware";
 import { OtpVerification } from "../models/OtpVerification";
 import { User } from "../models/User";
+import { trackEvent } from "../utils/analytics";
 import {
   createRefreshToken,
   createToken,
@@ -179,6 +180,12 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
       authProvider: "password",
     });
 
+    trackEvent(req, {
+      type: "USER_SIGNUP",
+      userId: String(user._id),
+      metadata: { provider: "password" },
+    });
+
     res.status(201).json(createAuthResponse("Signup successful", user));
   } catch (error) {
     console.error("Signup error", error);
@@ -225,6 +232,12 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    trackEvent(req, {
+      type: "USER_LOGIN",
+      userId: String(user._id),
+      metadata: { provider: "password" },
+    });
+
     res.status(200).json(createAuthResponse("Login successful", user));
   } catch (error) {
     console.error("Login error", error);
@@ -268,9 +281,11 @@ export const googleLogin = async (
     let user = await User.findOne({
       $or: [{ googleId: tokenInfo.sub }, { email }],
     }).select("+password");
+    let isNewUser = false;
 
     if (!user) {
       // First-time Google signup
+      isNewUser = true;
       user = await User.create({
         name: tokenInfo.name || email.split("@")[0],
         email,
@@ -291,6 +306,12 @@ export const googleLogin = async (
 
       await user.save();
     }
+
+    trackEvent(req, {
+      type: isNewUser ? "USER_SIGNUP" : "USER_LOGIN",
+      userId: String(user._id),
+      metadata: { provider: "google" },
+    });
 
     res.status(200).json(createAuthResponse("Google login successful", user));
   } catch (error) {
@@ -380,7 +401,9 @@ export const verifyMobileOtp = async (
     await OtpVerification.deleteOne({ _id: otpRecord._id });
 
     let user = await User.findOne({ phoneNumber });
+    let isNewUser = false;
     if (!user) {
+      isNewUser = true;
       user = await User.create({
         name: phoneNumber,
         phoneNumber,
@@ -393,6 +416,12 @@ export const verifyMobileOtp = async (
       user.authProvider = "mobile";
       await user.save();
     }
+
+    trackEvent(req, {
+      type: isNewUser ? "USER_SIGNUP" : "USER_LOGIN",
+      userId: String(user._id),
+      metadata: { provider: "mobile" },
+    });
 
     res.status(200).json(createAuthResponse("Mobile login successful", user));
   } catch (error) {

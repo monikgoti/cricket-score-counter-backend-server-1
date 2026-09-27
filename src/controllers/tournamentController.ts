@@ -28,6 +28,8 @@ import {
   SavedPlayerTeam,
   type ISavedPlayerTeam,
 } from "../models/SavedPlayerTeam";
+import { trackEvent } from "../utils/analytics";
+import { parsePagination, buildPaginationMeta } from "../utils/pagination";
 
 const normalizeText = (value: unknown) =>
   typeof value === "string" ? value.trim() : "";
@@ -1027,6 +1029,12 @@ export const createTournament = async (
       status: "draft",
     });
 
+    trackEvent(req, {
+      type: "TOURNAMENT_CREATED",
+      userId,
+      metadata: { tournamentId: String(tournament._id), name: tournament.name },
+    });
+
     res.status(201).json({
       tournament: await serializeTournament(tournament, userId, true),
     });
@@ -1052,10 +1060,20 @@ export const getTournaments = async (
       query.status = req.query.status;
     }
 
-    const tournaments = await Tournament.find(query).sort({
-      startDate: -1,
-      createdAt: -1,
-    });
+    // GET /api/v1/tournaments?page=1&limit=20 -- page/limit are optional;
+    // omitting them keeps the old page-1-of-20 default so existing callers
+    // still work, they just stop getting everything past the first page.
+    const pagination = parsePagination(
+      req.query as Record<string, unknown>,
+    );
+
+    const [total, tournaments] = await Promise.all([
+      Tournament.countDocuments(query),
+      Tournament.find(query)
+        .sort({ startDate: -1, createdAt: -1 })
+        .skip(pagination.skip)
+        .limit(pagination.limit),
+    ]);
 
     res.status(200).json({
       tournaments: await Promise.all(
@@ -1063,6 +1081,7 @@ export const getTournaments = async (
           serializeTournament(tournament, userId, true),
         ),
       ),
+      pagination: buildPaginationMeta(total, pagination),
     });
   } catch (error) {
     console.error("Get tournaments error", error);
@@ -1708,6 +1727,16 @@ export const startTournamentMatch = async (
           : undefined,
         startedAt,
       });
+
+      trackEvent(req, {
+        type: "MATCH_STARTED",
+        userId,
+        metadata: {
+          matchId: String(match._id),
+          tournamentId: String(tournament._id),
+          mode: "tournament",
+        },
+      });
     }
 
     const teamById = new Map(teams.map((team) => [String(team._id), team]));
@@ -1724,6 +1753,7 @@ export const startTournamentMatch = async (
 export const completeTournamentMatchFromSavedMatch = async (
   userId: string,
   body: Record<string, unknown>,
+  req: AuthenticatedRequest,
 ): Promise<{
   match: ReturnType<typeof serializeMatch>;
   teams: ReturnType<typeof serializeTeam>[];
@@ -1774,6 +1804,16 @@ export const completeTournamentMatchFromSavedMatch = async (
         normalizeText(body?.gameId) ||
         undefined,
       startedAt: new Date(),
+    });
+
+    trackEvent(req, {
+      type: "MATCH_STARTED",
+      userId,
+      metadata: {
+        matchId: String(match._id),
+        tournamentId: String(tournament._id),
+        mode: "tournament",
+      },
     });
   }
 
@@ -1841,6 +1881,16 @@ export const completeTournamentMatchFromSavedMatch = async (
   match.completedAt = new Date();
 
   await match.save();
+
+  trackEvent(req, {
+    type: "MATCH_COMPLETED",
+    userId,
+    metadata: {
+      matchId: String(match._id),
+      tournamentId: String(tournament._id),
+      mode: "tournament",
+    },
+  });
   const recalculatedTeams = await recalculateTournamentStatistics(
     tournament._id as Types.ObjectId,
     userId,
@@ -1914,6 +1964,16 @@ export const completeTournamentMatch = async (
           undefined,
         startedAt: new Date(),
       });
+
+      trackEvent(req, {
+        type: "MATCH_STARTED",
+        userId,
+        metadata: {
+          matchId: String(match._id),
+          tournamentId: String(tournament._id),
+          mode: "tournament",
+        },
+      });
     }
 
     const teams = await TournamentTeam.find({
@@ -1958,6 +2018,16 @@ export const completeTournamentMatch = async (
     match.completedAt = new Date();
 
     await match.save();
+
+    trackEvent(req, {
+      type: "MATCH_COMPLETED",
+      userId,
+      metadata: {
+        matchId: String(match._id),
+        tournamentId: String(tournament._id),
+        mode: "tournament",
+      },
+    });
     const recalculatedTeams = await recalculateTournamentStatistics(
       tournament._id as Types.ObjectId,
       userId,
