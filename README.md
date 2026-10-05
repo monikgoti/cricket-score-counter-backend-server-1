@@ -125,6 +125,39 @@ Requires `Authorization: Bearer <token>`.
 }
 ```
 
+### Delete Account (permanent, hard delete)
+
+`DELETE /api/v1/auth/account`
+
+Requires `Authorization: Bearer <token>`.
+
+```json
+{
+  "confirmation": "DELETE",
+  "password": "current-password"
+}
+```
+
+`password` is required only when the account has one (Google-only and
+phone-OTP accounts send just `confirmation`).
+
+In one MongoDB transaction, this physically deletes the user and everything
+they own: tournaments plus their teams and fixtures, saved player teams,
+player profiles they created, players, saved matches, analytics events
+(including anonymous events from sessions they were signed in on), and
+pending OTP codes. The user record is deleted last. Nothing is soft-deleted
+or anonymised. Existing access tokens stop working immediately, because
+`requireAuth` rejects tokens whose user no longer exists.
+
+| Status | Meaning |
+|--------|---------|
+| `200`  | `{ "deleted": true }`, also returned when the account was already deleted |
+| `400`  | `confirmation` is not `"DELETE"` |
+| `401`  | Missing or invalid token |
+| `403`  | Password missing or incorrect |
+| `429`  | More than 5 attempts in 15 minutes |
+| `500`  | Deletion failed and was rolled back; nothing was deleted |
+
 ## Tournament API
 
 All tournament routes require `Authorization: Bearer <token>`.
