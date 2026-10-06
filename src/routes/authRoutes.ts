@@ -1,6 +1,10 @@
 import { Router } from "express";
 import {
+  forgotPassword,
+  getAuthConfig,
   getCurrentUser,
+  resendVerificationEmail,
+  verifyEmail,
   googleLogin,
   login,
   logout,
@@ -19,10 +23,14 @@ const router = Router();
 router.post("/signup", signup);
 router.post("/login", login);
 router.post("/google", googleLogin);
+router.get("/config", getAuthConfig);
 router.post("/mobile/request-otp", requestMobileOtp);
 router.post("/mobile/verify-otp", verifyMobileOtp);
 router.post("/refresh", refreshToken);
+router.post("/forgot-password", forgotPassword);
 router.post("/reset-password", resetPassword);
+router.post("/email/verify", verifyEmail);
+router.post("/email/resend", resendVerificationEmail);
 router.post("/set-password", requireAuth, setPassword);
 router.get("/me", requireAuth, getCurrentUser);
 router.post("/logout", logout);

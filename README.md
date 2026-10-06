@@ -108,22 +108,95 @@ Fallback routes also supported:
 }
 ```
 
+### Mobile number login (SMS via Brevo)
+
+**`SMS_DELIVERY=direct`** turns SMS off: `request-otp` returns the code as
+`{ "otp": "123456", "delivery": "direct" }` and the app fills it in. Limits,
+expiry and the login/signup rules still apply, but the code no longer proves
+the person owns the number, so anyone can log in to a registered number.
+Remove it (or set `SMS_DELIVERY=brevo`) to send real SMS again.
+
+Codes are sent with Brevo's transactional SMS API
+(`POST https://api.brevo.com/v3/transactionalSMS/send`) using `BREVO_API_KEY`
+and `BREVO_SMS_SENDER` (see `.env.example`). SMS needs Brevo credits, and
+Indian numbers also need a DLT-registered sender and template
+(`BREVO_SMS_TEMPLATE`, placeholders `{code}` and `{minutes}`).
+
+- `GET /api/v1/auth/config` → `{ "mobileOtpLogin": true|false }`. The app only
+  shows mobile login when this is true (SMS configured, or in development
+  where codes are printed to the server log).
+- `POST /api/v1/auth/mobile/request-otp` `{ "phoneNumber", "intent": "login"|"signup" }`
+  - `intent: "login"` with an unregistered number → `404 ACCOUNT_NOT_FOUND`,
+    and no SMS is sent.
+  - `429 OTP_COOLDOWN` within 60 s of the last code, `429 OTP_LIMIT` after 5
+    codes in an hour (both include `resendAfterSeconds`).
+- `POST /api/v1/auth/mobile/verify-otp` `{ "phoneNumber", "otp", "intent", "name"? }`
+  → login response. `intent: "signup"` creates the account (using `name`
+  if given). Codes expire after 10 minutes and 5 wrong tries cancel a code.
+
 ### Logout
 
 `POST /api/v1/auth/logout`
 
 Requires `Authorization: Bearer <token>`.
 
+### Email verification (email/password signups)
+
+Codes are sent through **Brevo's transactional email API** when
+`BREVO_API_KEY` and `BREVO_SENDER_EMAIL` are set (free plan: 300 emails/day;
+the sender address must be verified in Brevo). Otherwise they fall back to
+SMTP via Nodemailer (`SMTP_USER`, `SMTP_PASS`, optional `SMTP_HOST`,
+`SMTP_PORT`, `MAIL_FROM`). See `.env.example`. With neither configured,
+codes are printed to the server log in development and the endpoints return
+`503` in production. Emails are tagged `verify_email` / `reset_password`, so
+they can be filtered in Brevo's transactional logs.
+
+- `POST /api/v1/auth/signup` now returns `201` **without tokens**:
+  `{ "verificationRequired": true, "email": "...", "resendAfterSeconds": 60 }`
+  and emails a 6-digit code. Signing up again with an email that was never
+  verified updates the name/password and sends a new code.
+- `POST /api/v1/auth/email/verify` `{ "email", "otp" }` → the normal login
+  response (tokens + user) once the code is correct.
+- `POST /api/v1/auth/email/resend` `{ "email" }` → sends a new code.
+- `POST /api/v1/auth/login` for an unverified account returns `403`
+  `{ "code": "EMAIL_NOT_VERIFIED", "email" }` and sends a fresh code.
+
+Accounts created before verification existed (no `emailVerified` field) and
+Google accounts count as verified. Google sign-in now requires Google's
+`email_verified` flag before creating or linking an account.
+
+Limits: codes expire after 10 minutes, 5 wrong tries invalidate a code,
+60 seconds between sends, and at most 5 emails per address per hour (all
+configurable with `EMAIL_OTP_*` env vars).
+
+### Google sign-in
+
+`POST /api/v1/auth/google` `{ "idToken", "intent": "login" | "signup" }`
+
+- `intent: "login"` (the Login page) never creates an account. An
+  unregistered Google account gets `404 { "code": "ACCOUNT_NOT_FOUND" }`.
+- `intent: "signup"` (the Sign Up page) creates the account if needed.
+- No `intent` (older app versions) behaves like `"signup"`.
+
+Existing accounts with the same email are linked, and only emails Google
+reports as verified are accepted.
+
 ### Reset Password
 
-`POST /api/v1/auth/reset-password`
+Step 1 — `POST /api/v1/auth/forgot-password` `{ "email" }` emails a code.
+The response is the same whether or not the account exists.
+
+Step 2 — `POST /api/v1/auth/reset-password`
 
 ```json
 {
   "email": "monik@example.com",
+  "otp": "123456",
   "newPassword": "newpassword123"
 }
 ```
+
+Returns the normal login response. Requests without a valid code are refused.
 
 ### Delete Account (permanent, hard delete)
 

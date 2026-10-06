@@ -5,6 +5,21 @@ import { OtpVerification } from "../models/OtpVerification";
 import { User } from "../models/User";
 import { trackEvent } from "../utils/analytics";
 import {
+  issueEmailOtp,
+  OTP_ERROR_MESSAGES,
+  verifyEmailOtp,
+  type IssueOtpResult,
+} from "../utils/emailOtp";
+import { MailerNotConfiguredError } from "../utils/mailer";
+import {
+  buildOtpSms,
+  isDirectOtpMode,
+  isMobileLoginAvailable,
+  sendSms,
+  SmsNotConfiguredError,
+} from "../utils/sms";
+import { randomInt } from "crypto";
+import {
   createRefreshToken,
   createToken,
   verifyRefreshToken,
@@ -46,6 +61,7 @@ const serializeUser = (user: {
   _id: unknown;
   name: string;
   email?: string;
+  emailVerified?: boolean;
   password?: string;
   phoneNumber?: string;
   authProvider?: string;
@@ -58,6 +74,7 @@ const serializeUser = (user: {
   authProvider: user.authProvider ?? "password",
   avatarUrl: user.avatarUrl ?? "",
   hasPassword: Boolean(user.password),
+  emailVerified: user.emailVerified !== false,
 });
 
 const createAuthResponse = (
@@ -66,6 +83,7 @@ const createAuthResponse = (
     _id: unknown;
     name: string;
     email?: string;
+    emailVerified?: boolean;
     password?: string;
     phoneNumber?: string;
     authProvider?: string;
@@ -149,7 +167,52 @@ const verifyGoogleIdToken = async (
 };
 
 const generateOtp = (): string =>
-  Math.floor(100000 + Math.random() * 900000).toString();
+  randomInt(0, 1_000_000).toString().padStart(6, "0");
+
+
+// ---------------------------------------------------------------------------
+// Email verification codes
+// ---------------------------------------------------------------------------
+
+/** Sends a code; on failure responds with a 5xx and returns null. */
+const sendEmailCode = async (
+  res: Response,
+  email: string,
+  purpose: "verify_email" | "reset_password",
+  name?: string,
+): Promise<IssueOtpResult | null> => {
+  try {
+    return await issueEmailOtp(email, purpose, name);
+  } catch (error) {
+    console.error("Send email code error", {
+      purpose,
+      error: error instanceof Error ? error.message : error,
+    });
+    res.status(error instanceof MailerNotConfiguredError ? 503 : 502).json({
+      message:
+        "We couldn't send the email right now. Please try again in a few minutes.",
+    });
+    return null;
+  }
+};
+
+const resendInfo = (result: IssueOtpResult) => ({
+  resendAfterSeconds: result.resendAfterSeconds,
+  ...(result.status === "limited"
+    ? {
+        message:
+          "Too many codes requested. Please use the latest code we sent, or try again later.",
+      }
+    : {}),
+});
+
+const getOtpFromBody = (body: unknown): string => {
+  const value = (body as { otp?: unknown; code?: unknown } | undefined) ?? {};
+  const raw = value.otp ?? value.code;
+  return typeof raw === "string" || typeof raw === "number"
+    ? String(raw).replace(/\s/g, "")
+    : "";
+};
 
 export const signup = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -165,28 +228,46 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
+    const saltRounds = Number(process.env.BCRYPT_SALT_ROUNDS || 12);
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+
+    let user = await User.findOne({ email });
+    if (user && user.emailVerified !== false) {
       res.status(409).json({ message: "User already exists" });
       return;
     }
 
-    const saltRounds = Number(process.env.BCRYPT_SALT_ROUNDS || 12);
-    const hashedPassword = await bcrypt.hash(password, saltRounds);
-    const user = await User.create({
-      name,
+    if (user) {
+      // Signed up before but never verified: whoever owns the inbox should
+      // be able to finish, so take the latest details and send a new code.
+      user.name = name;
+      user.password = hashedPassword;
+      await user.save();
+    } else {
+      user = await User.create({
+        name,
+        email,
+        password: hashedPassword,
+        authProvider: "password",
+        emailVerified: false,
+      });
+      trackEvent(req, {
+        type: "USER_SIGNUP",
+        userId: String(user._id),
+        metadata: { provider: "password" },
+      });
+    }
+
+    const sent = await sendEmailCode(res, email, "verify_email", name);
+    if (!sent) return;
+
+    // No tokens until the email is verified (POST /auth/email/verify).
+    res.status(201).json({
+      message: "We've sent a 6-digit code to your email.",
+      verificationRequired: true,
       email,
-      password: hashedPassword,
-      authProvider: "password",
+      ...resendInfo(sent),
     });
-
-    trackEvent(req, {
-      type: "USER_SIGNUP",
-      userId: String(user._id),
-      metadata: { provider: "password" },
-    });
-
-    res.status(201).json(createAuthResponse("Signup successful", user));
   } catch (error) {
     console.error("Signup error", error);
     res.status(500).json({ message: "Unable to signup" });
@@ -228,6 +309,18 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     if (!passwordMatches) {
       res.status(401).json({
         message: "Invalid email or password",
+      });
+      return;
+    }
+
+    if (user.emailVerified === false) {
+      const sent = await sendEmailCode(res, email, "verify_email", user.name);
+      if (!sent) return;
+      res.status(403).json({
+        code: "EMAIL_NOT_VERIFIED",
+        message: "Please verify your email. We've sent a 6-digit code to it.",
+        email,
+        ...resendInfo(sent),
       });
       return;
     }
@@ -278,10 +371,39 @@ export const googleLogin = async (
       return;
     }
 
+    // Only trust (and link accounts by) an email Google has verified.
+    const googleEmailVerified =
+      tokenInfo.email_verified === true || tokenInfo.email_verified === "true";
+    if (!googleEmailVerified) {
+      res.status(400).json({
+        message:
+          "Your Google account's email isn't verified. Verify it with Google, or sign up with email instead.",
+      });
+      return;
+    }
+
     let user = await User.findOne({
       $or: [{ googleId: tokenInfo.sub }, { email }],
     }).select("+password");
     let isNewUser = false;
+
+    // "login" (the Login page) must never create an account; only the
+    // Sign Up page ("signup") may. Older app versions send no intent and
+    // keep the previous create-if-missing behaviour.
+    const intent =
+      req.body?.intent === "login" || req.body?.intent === "signup"
+        ? req.body.intent
+        : "signup";
+
+    if (!user && intent === "login") {
+      res.status(404).json({
+        code: "ACCOUNT_NOT_FOUND",
+        message:
+          "No account found for this Google account. Please sign up first.",
+        email,
+      });
+      return;
+    }
 
     if (!user) {
       // First-time Google signup
@@ -292,6 +414,8 @@ export const googleLogin = async (
         googleId: tokenInfo.sub,
         avatarUrl: tokenInfo.picture,
         authProvider: "google",
+        emailVerified: true,
+        emailVerifiedAt: new Date(),
       });
     } else {
       // Link Google account if not already linked
@@ -303,6 +427,11 @@ export const googleLogin = async (
       user.name = tokenInfo.name || user.name;
       user.avatarUrl = tokenInfo.picture || user.avatarUrl;
       user.authProvider = "google";
+      if (user.emailVerified === false) {
+        // Google just proved ownership of this email.
+        user.emailVerified = true;
+        user.emailVerifiedAt = new Date();
+      }
 
       await user.save();
     }
@@ -326,6 +455,34 @@ export const googleLogin = async (
   }
 };
 
+const MOBILE_OTP_MINUTES = () => Number(process.env.OTP_EXPIRES_MINUTES || 10);
+const MOBILE_OTP_MAX_ATTEMPTS = () => Number(process.env.OTP_MAX_ATTEMPTS || 5);
+const MOBILE_OTP_RESEND_SECONDS = () =>
+  Number(process.env.OTP_RESEND_SECONDS || 60);
+const MOBILE_OTP_MAX_SENDS_PER_HOUR = () =>
+  Number(process.env.OTP_MAX_SENDS_PER_HOUR || 5);
+const HOUR_MS = 60 * 60 * 1000;
+
+/** "login" (Login page) never creates an account; "signup" may. No intent
+ *  (older app versions) keeps the old create-if-missing behaviour. */
+const getAuthIntent = (body: unknown): "login" | "signup" => {
+  const intent = (body as { intent?: unknown } | undefined)?.intent;
+  return intent === "login" ? "login" : "signup";
+};
+
+const mobileAccountNotFound = (res: Response, phoneNumber: string) => {
+  res.status(404).json({
+    code: "ACCOUNT_NOT_FOUND",
+    message: "No account found for this mobile number. Please sign up first.",
+    phoneNumber,
+  });
+};
+
+// What the app can offer on its login screens (no secrets).
+export const getAuthConfig = (_req: Request, res: Response): void => {
+  res.status(200).json({ mobileOtpLogin: isMobileLoginAvailable() });
+};
+
 export const requestMobileOtp = async (
   req: Request,
   res: Response,
@@ -333,29 +490,117 @@ export const requestMobileOtp = async (
   try {
     const phoneNumber = normalizePhoneNumber(req.body?.phoneNumber);
     if (!phoneNumber) {
-      res.status(400).json({ message: "Valid phone number is required" });
+      res.status(400).json({
+        message: "Enter a valid mobile number with country code, e.g. +91 9876543210",
+      });
       return;
+    }
+
+    if (!isMobileLoginAvailable()) {
+      res.status(503).json({ message: "Mobile login isn't available right now. Please use email." });
+      return;
+    }
+
+    // Don't spend SMS credits on numbers that can't log in anyway.
+    if (
+      getAuthIntent(req.body) === "login" &&
+      !(await User.exists({ phoneNumber }))
+    ) {
+      mobileAccountNotFound(res, phoneNumber);
+      return;
+    }
+
+    const now = Date.now();
+    const existing = await OtpVerification.findOne({ phoneNumber });
+    let sendCount = 0;
+    let windowStart = new Date(now);
+    if (existing?.lastSentAt) {
+      const cooldownMs = MOBILE_OTP_RESEND_SECONDS() * 1000;
+      const sinceLast = now - existing.lastSentAt.getTime();
+      if (sinceLast < cooldownMs) {
+        res.status(429).json({
+          code: "OTP_COOLDOWN",
+          message: "Please wait before requesting another code.",
+          resendAfterSeconds: Math.ceil((cooldownMs - sinceLast) / 1000),
+        });
+        return;
+      }
+      if (
+        existing.sendWindowStartedAt &&
+        now - existing.sendWindowStartedAt.getTime() < HOUR_MS
+      ) {
+        sendCount = existing.sendCount ?? 0;
+        windowStart = existing.sendWindowStartedAt;
+      }
+      if (sendCount >= MOBILE_OTP_MAX_SENDS_PER_HOUR()) {
+        res.status(429).json({
+          code: "OTP_LIMIT",
+          message: "Too many codes requested. Please try again later.",
+          resendAfterSeconds: Math.ceil((windowStart.getTime() + HOUR_MS - now) / 1000),
+        });
+        return;
+      }
     }
 
     const otp = generateOtp();
     const saltRounds = Number(process.env.BCRYPT_SALT_ROUNDS || 12);
     const otpHash = await bcrypt.hash(otp, saltRounds);
-    const expiryMinutes = Number(process.env.OTP_EXPIRES_MINUTES || 10);
-    const expiresAt = new Date(Date.now() + expiryMinutes * 60 * 1000);
+    const minutes = MOBILE_OTP_MINUTES();
+    const codeExpiresAt = new Date(now + minutes * 60 * 1000);
 
     await OtpVerification.findOneAndUpdate(
       { phoneNumber },
-      { phoneNumber, otpHash, expiresAt, attempts: 0 },
+      {
+        phoneNumber,
+        otpHash,
+        codeExpiresAt,
+        expiresAt: new Date(
+          Math.max(codeExpiresAt.getTime(), windowStart.getTime() + HOUR_MS),
+        ),
+        attempts: 0,
+        lastSentAt: new Date(now),
+        sendCount: sendCount + 1,
+        sendWindowStartedAt: windowStart,
+      },
       { upsert: true, returnDocument: "after", setDefaultsOnInsert: true },
     );
 
-    if (process.env.NODE_ENV !== "production") {
-      console.log(`OTP for ${phoneNumber}: ${otp}`);
+    // Direct mode: skip the SMS and hand the code back in the response.
+    if (isDirectOtpMode()) {
+      res.status(200).json({
+        message: "Here is your code.",
+        delivery: "direct",
+        otp,
+        resendAfterSeconds: MOBILE_OTP_RESEND_SECONDS(),
+      });
+      return;
+    }
+
+    try {
+      await sendSms(phoneNumber, buildOtpSms(otp, minutes));
+    } catch (error) {
+      // Let them retry straight away instead of waiting out the cooldown.
+      await OtpVerification.updateOne(
+        { phoneNumber },
+        { lastSentAt: new Date(0), $inc: { sendCount: -1 } },
+      );
+      console.error("Send SMS error", {
+        error: error instanceof Error ? error.message : error,
+      });
+      res.status(error instanceof SmsNotConfiguredError ? 503 : 502).json({
+        message: "We couldn't send the SMS right now. Please try again in a few minutes, or use email.",
+      });
+      return;
     }
 
     res.status(200).json({
       message: "OTP sent",
-      ...(process.env.OTP_DEBUG_RESPONSE === "true" ? { otp } : {}),
+      delivery: "sms",
+      resendAfterSeconds: MOBILE_OTP_RESEND_SECONDS(),
+      ...(process.env.OTP_DEBUG_RESPONSE === "true" &&
+      process.env.NODE_ENV !== "production"
+        ? { otp }
+        : {}),
     });
   } catch (error) {
     console.error("Request mobile OTP error", error);
@@ -369,7 +614,7 @@ export const verifyMobileOtp = async (
 ): Promise<void> => {
   try {
     const phoneNumber = normalizePhoneNumber(req.body?.phoneNumber);
-    const otp = typeof req.body?.otp === "string" ? req.body.otp.trim() : "";
+    const otp = getOtpFromBody(req.body);
 
     if (!phoneNumber || !otp) {
       res.status(400).json({ message: "Phone number and OTP are required" });
@@ -379,39 +624,55 @@ export const verifyMobileOtp = async (
     const otpRecord = await OtpVerification.findOne({ phoneNumber }).select(
       "+otpHash",
     );
-    if (!otpRecord || otpRecord.expiresAt < new Date()) {
-      res.status(401).json({ message: "Invalid or expired OTP" });
+    const codeExpiresAt = otpRecord?.codeExpiresAt ?? otpRecord?.expiresAt;
+    if (!otpRecord || !codeExpiresAt || codeExpiresAt.getTime() < Date.now()) {
+      res.status(401).json({ code: "INVALID_OTP", message: "That code has expired. Request a new one." });
       return;
     }
 
-    if (otpRecord.attempts >= Number(process.env.OTP_MAX_ATTEMPTS || 5)) {
-      await OtpVerification.deleteOne({ _id: otpRecord._id });
-      res.status(429).json({ message: "Too many OTP attempts" });
+    if (otpRecord.attempts >= MOBILE_OTP_MAX_ATTEMPTS()) {
+      res.status(429).json({ code: "INVALID_OTP", message: "Too many wrong attempts. Request a new code." });
       return;
     }
 
-    const otpMatches = await bcrypt.compare(otp, otpRecord.otpHash);
+    const otpMatches =
+      /^\d{6}$/.test(otp) && (await bcrypt.compare(otp, otpRecord.otpHash));
     if (!otpMatches) {
       otpRecord.attempts += 1;
       await otpRecord.save();
-      res.status(401).json({ message: "Invalid or expired OTP" });
+      res.status(401).json({
+        code: "INVALID_OTP",
+        message:
+          otpRecord.attempts >= MOBILE_OTP_MAX_ATTEMPTS()
+            ? "Too many wrong attempts. Request a new code."
+            : "That code isn't right. Check the SMS and try again.",
+      });
       return;
     }
 
-    await OtpVerification.deleteOne({ _id: otpRecord._id });
+    // Consume the code but keep the send counters until the doc's TTL.
+    await OtpVerification.updateOne(
+      { _id: otpRecord._id },
+      { codeExpiresAt: new Date(0), attempts: 0 },
+    );
 
     let user = await User.findOne({ phoneNumber });
     let isNewUser = false;
     if (!user) {
+      if (getAuthIntent(req.body) === "login") {
+        mobileAccountNotFound(res, phoneNumber);
+        return;
+      }
       isNewUser = true;
       user = await User.create({
-        name: phoneNumber,
+        name: typeof req.body?.name === "string" && req.body.name.trim()
+          ? req.body.name.trim()
+          : phoneNumber,
         phoneNumber,
         phoneVerifiedAt: new Date(),
         authProvider: "mobile",
       });
     } else {
-      user.phoneNumber = phoneNumber;
       user.phoneVerifiedAt = new Date();
       user.authProvider = "mobile";
       await user.save();
@@ -470,35 +731,175 @@ export const refreshToken = async (
   }
 };
 
+// Step 1 of a password reset: email a code. Always answers the same way,
+// whether or not the email has an account, so it can't be used to find
+// out who is registered.
+export const forgotPassword = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    if (!email) {
+      res.status(400).json({ message: "A valid email is required" });
+      return;
+    }
+
+    const generic = {
+      message:
+        "If an account exists for this email, we've sent a 6-digit code to it.",
+    };
+
+    const user = await User.findOne({ email });
+    if (!user) {
+      res.status(200).json({ ...generic, resendAfterSeconds: 60 });
+      return;
+    }
+
+    const sent = await sendEmailCode(res, email, "reset_password", user.name);
+    if (!sent) return;
+    res.status(200).json({ ...generic, ...resendInfo(sent) });
+  } catch (error) {
+    console.error("Forgot password error", error);
+    res.status(500).json({ message: "Unable to send reset code" });
+  }
+};
+
+// Step 2: the emailed code + a new password. Logs the user in on success.
 export const resetPassword = async (
   req: Request,
   res: Response,
 ): Promise<void> => {
   try {
     const email = normalizeEmail(req.body?.email);
-    const newPassword = req.body?.newPassword;
+    const otp = getOtpFromBody(req.body);
+    const newPassword = req.body?.newPassword ?? req.body?.password;
 
-    if (!email || !isStrongEnoughPassword(newPassword)) {
+    if (!email || !otp) {
       res.status(400).json({
-        message: "Valid email and new password with 6+ characters are required",
+        message: "Email and the 6-digit code from your email are required",
       });
+      return;
+    }
+    if (!isStrongEnoughPassword(newPassword)) {
+      res.status(400).json({
+        message: "New password must be at least 6 characters",
+      });
+      return;
+    }
+
+    const result = await verifyEmailOtp(email, "reset_password", otp);
+    if (result !== "ok") {
+      res.status(400).json({ code: "INVALID_OTP", message: OTP_ERROR_MESSAGES[result] });
       return;
     }
 
     const user = await User.findOne({ email }).select("+password");
     if (!user) {
-      res.status(404).json({ message: "User not found" });
+      res.status(400).json({ code: "INVALID_OTP", message: OTP_ERROR_MESSAGES.expired });
       return;
     }
 
     const saltRounds = Number(process.env.BCRYPT_SALT_ROUNDS || 12);
     user.password = await bcrypt.hash(newPassword, saltRounds);
+    if (user.emailVerified === false) {
+      // The code proves they own the inbox.
+      user.emailVerified = true;
+      user.emailVerifiedAt = new Date();
+    }
     await user.save();
 
-    res.status(200).json({ message: "Password reset successful" });
+    res
+      .status(200)
+      .json(createAuthResponse("Password reset successful", user));
   } catch (error) {
     console.error("Reset password error", error);
     res.status(500).json({ message: "Unable to reset password" });
+  }
+};
+
+export const verifyEmail = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const otp = getOtpFromBody(req.body);
+    if (!email || !otp) {
+      res.status(400).json({ message: "Email and the 6-digit code are required" });
+      return;
+    }
+
+    const user = await User.findOne({ email }).select("+password");
+    if (!user) {
+      res.status(400).json({ code: "INVALID_OTP", message: OTP_ERROR_MESSAGES.expired });
+      return;
+    }
+    if (user.emailVerified === false) {
+      const result = await verifyEmailOtp(email, "verify_email", otp);
+      if (result !== "ok") {
+        res.status(400).json({ code: "INVALID_OTP", message: OTP_ERROR_MESSAGES[result] });
+        return;
+      }
+      user.emailVerified = true;
+      user.emailVerifiedAt = new Date();
+      await user.save();
+    } else {
+      // Already verified: still require a correct code before handing out
+      // tokens, otherwise this endpoint would be a password-less login.
+      const result = await verifyEmailOtp(email, "verify_email", otp);
+      if (result !== "ok") {
+        res.status(400).json({ code: "INVALID_OTP", message: OTP_ERROR_MESSAGES[result] });
+        return;
+      }
+    }
+
+    trackEvent(req, {
+      type: "USER_LOGIN",
+      userId: String(user._id),
+      metadata: { provider: "password", via: "email_verification" },
+    });
+
+    res.status(200).json(createAuthResponse("Email verified", user));
+  } catch (error) {
+    console.error("Verify email error", error);
+    res.status(500).json({ message: "Unable to verify email" });
+  }
+};
+
+export const resendVerificationEmail = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    if (!email) {
+      res.status(400).json({ message: "A valid email is required" });
+      return;
+    }
+
+    const user = await User.findOne({ email });
+    // Same answer whether or not there's anything to verify.
+    if (!user || user.emailVerified !== false) {
+      res.status(200).json({
+        message: "If this email needs verifying, we've sent a new code.",
+        resendAfterSeconds: 60,
+      });
+      return;
+    }
+
+    const sent = await sendEmailCode(res, email, "verify_email", user.name);
+    if (!sent) return;
+    res.status(200).json({
+      message:
+        sent.status === "sent"
+          ? "We've sent a new code to your email."
+          : "Please wait before requesting another code.",
+      ...resendInfo(sent),
+    });
+  } catch (error) {
+    console.error("Resend verification error", error);
+    res.status(500).json({ message: "Unable to resend code" });
   }
 };
 

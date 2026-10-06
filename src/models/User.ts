@@ -10,6 +10,11 @@ export interface IUser extends Document {
   googleId?: string;
   phoneNumber?: string;
   phoneVerifiedAt?: Date;
+  /** false only for email/password signups that haven't entered their
+   *  email code yet. Missing (accounts created before verification
+   *  existed) counts as verified, so nobody gets locked out. */
+  emailVerified?: boolean;
+  emailVerifiedAt?: Date;
   authProvider: AuthProvider;
   avatarUrl?: string;
   createdAt: Date;
@@ -51,6 +56,12 @@ const userSchema = new Schema<IUser>(
       index: true,
     },
     phoneVerifiedAt: {
+      type: Date,
+    },
+    emailVerified: {
+      type: Boolean,
+    },
+    emailVerifiedAt: {
       type: Date,
     },
     authProvider: {

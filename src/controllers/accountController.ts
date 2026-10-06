@@ -2,6 +2,7 @@ import bcrypt from "bcryptjs";
 import mongoose, { Types, type ClientSession } from "mongoose";
 import type { Request, Response } from "express";
 import { AnalyticsEvent } from "../models/AnalyticsEvent";
+import { EmailOtp } from "../models/EmailOtp";
 import { OtpVerification } from "../models/OtpVerification";
 import { Player } from "../models/Player";
 import { PlayerIdentity } from "../models/PlayerIdentity";
@@ -51,7 +52,7 @@ export type AccountDeletionCounts = Record<string, number>;
  * MongoDB transaction does not support concurrent operations on one session.
  */
 export const hardDeleteUserData = async (
-  user: { _id: Types.ObjectId; phoneNumber?: string },
+  user: { _id: Types.ObjectId; phoneNumber?: string; email?: string },
   session?: ClientSession,
 ): Promise<AccountDeletionCounts> => {
   const userId = user._id;
@@ -119,6 +120,11 @@ export const hardDeleteUserData = async (
   counts.otpVerifications = user.phoneNumber
     ? (await OtpVerification.deleteMany({ phoneNumber: user.phoneNumber }, opts))
         .deletedCount
+    : 0;
+
+  // Email verification / password reset codes.
+  counts.emailOtps = user.email
+    ? (await EmailOtp.deleteMany({ email: user.email }, opts)).deletedCount
     : 0;
 
   // The user record itself goes last.
@@ -203,6 +209,7 @@ export const deleteAccount = async (
     const target = {
       _id: user._id as Types.ObjectId,
       phoneNumber: user.phoneNumber,
+      email: user.email,
     };
 
     let counts: AccountDeletionCounts;
