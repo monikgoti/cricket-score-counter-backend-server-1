@@ -6,6 +6,7 @@ import {
   resendVerificationEmail,
   verifyEmail,
   googleLogin,
+  appleLogin,
   login,
   logout,
   requestMobileOtp,
@@ -23,6 +24,7 @@ const router = Router();
 router.post("/signup", signup);
 router.post("/login", login);
 router.post("/google", googleLogin);
+router.post("/apple", appleLogin);
 router.get("/config", getAuthConfig);
 router.post("/mobile/request-otp", requestMobileOtp);
 router.post("/mobile/verify-otp", verifyMobileOtp);

@@ -181,6 +181,35 @@ configurable with `EMAIL_OTP_*` env vars).
 Existing accounts with the same email are linked, and only emails Google
 reports as verified are accepted.
 
+### Sign in with Apple (iOS app)
+
+`POST /api/v1/auth/apple`
+
+```json
+{
+  "identityToken": "<JWT from Apple>",
+  "authorizationCode": "<one-time code from Apple>",
+  "nonce": "<raw nonce; the app gave Apple sha256hex(nonce)>",
+  "intent": "login",
+  "name": "Only sent on the first Apple authorization"
+}
+```
+
+- The identity token is verified against Apple's public keys: `iss`,
+  `aud` (`APPLE_CLIENT_ID`, default `com.cricketscorecounter.mobile`), `exp`
+  and `nonce`.
+- Users are found by `appleId` (the token's `sub`), then linked by an
+  Apple-verified email. `intent` works like Google's: `"login"` answers
+  `404 { "code": "ACCOUNT_NOT_FOUND" }`, `"signup"` creates the account (no
+  email code step; emails may be `@privaterelay.appleid.com`).
+- The `authorizationCode` is exchanged for an Apple refresh token (stored as
+  `appleRefreshToken`, not selected by default), which is revoked when the
+  account is deleted. Needs `APPLE_TEAM_ID`, `APPLE_KEY_ID` and
+  `APPLE_PRIVATE_KEY` (a "Sign in with Apple" `.p8` key); without them sign-in
+  still works but nothing can be revoked.
+- Errors: `400 INVALID_REQUEST`, `401 INVALID_APPLE_TOKEN`,
+  `502 APPLE_UNAVAILABLE`.
+
 ### Reset Password
 
 Step 1 — `POST /api/v1/auth/forgot-password` `{ "email" }` emails a code.
@@ -211,8 +240,10 @@ Requires `Authorization: Bearer <token>`.
 }
 ```
 
-`password` is required only when the account has one (Google-only and
-phone-OTP accounts send just `confirmation`).
+`password` is required only when the account has one (Google-only,
+Apple-only and phone-OTP accounts send just `confirmation`). Accounts that
+signed in with Apple also have their Apple token revoked first (best effort;
+a failed revoke is logged and never blocks deletion).
 
 In one MongoDB transaction, this physically deletes the user and everything
 they own: tournaments plus their teams and fixtures, saved player teams,

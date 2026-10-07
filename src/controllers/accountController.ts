@@ -13,6 +13,7 @@ import { TournamentMatch } from "../models/TournamentMatch";
 import { TournamentTeam } from "../models/TournamentTeam";
 import { User } from "../models/User";
 import { verifyTokenWithRefresh } from "../utils/jwt";
+import { revokeAppleToken } from "../utils/appleAuth";
 
 export const DELETE_ACCOUNT_CONFIRMATION = "DELETE";
 
@@ -181,7 +182,9 @@ export const deleteAccount = async (
   }
 
   try {
-    const user = await User.findById(userId).select("+password");
+    const user = await User.findById(userId).select(
+      "+password +appleRefreshToken",
+    );
     if (!user) {
       // Already deleted - idempotent success.
       res.status(200).json({ deleted: true });
@@ -206,6 +209,14 @@ export const deleteAccount = async (
       }
     }
 
+    // Sign in with Apple: revoke the user's Apple token so the app is
+    // unlinked from their Apple ID (App Store Guideline 5.1.1(v)). Best
+    // effort - never block deletion on Apple being reachable.
+    let appleTokenRevoked: boolean | undefined;
+    if (user.appleRefreshToken) {
+      appleTokenRevoked = await revokeAppleToken(user.appleRefreshToken);
+    }
+
     const target = {
       _id: user._id as Types.ObjectId,
       phoneNumber: user.phoneNumber,
@@ -227,7 +238,11 @@ export const deleteAccount = async (
 
     attemptsByUser.delete(userId);
     // Audit log: id and counts only - never email, name or password.
-    console.info("Account deleted", { userId, ...counts });
+    console.info("Account deleted", {
+      userId,
+      ...counts,
+      ...(appleTokenRevoked !== undefined ? { appleTokenRevoked } : {}),
+    });
 
     res.status(200).json({ deleted: true });
   } catch (error) {

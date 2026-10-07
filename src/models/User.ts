@@ -1,6 +1,6 @@
 import { Schema, model, type Document } from "mongoose";
 
-export const AUTH_PROVIDERS = ["password", "google", "mobile"] as const;
+export const AUTH_PROVIDERS = ["password", "google", "mobile", "apple"] as const;
 export type AuthProvider = (typeof AUTH_PROVIDERS)[number];
 
 export interface IUser extends Document {
@@ -8,6 +8,11 @@ export interface IUser extends Document {
   email?: string;
   password?: string;
   googleId?: string;
+  /** Sign in with Apple user ID (the identity token's `sub`). */
+  appleId?: string;
+  /** Apple refresh token, kept only so it can be revoked on account
+   *  deletion (App Store Guideline 5.1.1(v)). */
+  appleRefreshToken?: string;
   phoneNumber?: string;
   phoneVerifiedAt?: Date;
   /** false only for email/password signups that haven't entered their
@@ -47,6 +52,17 @@ const userSchema = new Schema<IUser>(
       sparse: true,
       trim: true,
       index: true,
+    },
+    appleId: {
+      type: String,
+      unique: true,
+      sparse: true,
+      trim: true,
+      index: true,
+    },
+    appleRefreshToken: {
+      type: String,
+      select: false,
     },
     phoneNumber: {
       type: String,
