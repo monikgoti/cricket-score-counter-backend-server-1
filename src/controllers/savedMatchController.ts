@@ -11,6 +11,7 @@ import { TournamentTeam, type ITournamentTeam } from "../models/TournamentTeam";
 import { completeTournamentMatchFromSavedMatch } from "./tournamentController";
 import { trackEvent } from "../utils/analytics";
 import { parsePagination, buildPaginationMeta } from "../utils/pagination";
+import { toSummarySnapshot, wantsSummaryView } from "../utils/snapshotSummary";
 
 const normalizeText = (value: unknown) =>
   typeof value === "string" ? value.trim() : "";
@@ -261,8 +262,17 @@ export const getMatches = async (
       pagination.skip + pagination.limit,
     );
 
+    // ?view=summary -> trimmed snapshots for the history list (see
+    // utils/snapshotSummary.ts). Without it the response is unchanged.
+    const responseMatches = wantsSummaryView(req.query)
+      ? pageMatches.map((match) => ({
+          ...match,
+          snapshot: toSummarySnapshot(match.snapshot),
+        }))
+      : pageMatches;
+
     res.status(200).json({
-      matches: pageMatches,
+      matches: responseMatches,
       pagination: buildPaginationMeta(total, pagination),
     });
   } catch (error) {

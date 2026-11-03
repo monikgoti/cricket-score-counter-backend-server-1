@@ -1,5 +1,6 @@
 require("dotenv").config();
 import express from "express";
+import compression from "compression";
 import type { Request, Response } from "express";
 import * as http from "http";
 import { connectDatabase } from "./config/database";
@@ -188,19 +189,46 @@ const getLiveUpdatesPayload = (): LiveUpdatePayload[] => {
   return liveUpdates;
 };
 const app = express();
+// gzip/deflate HTTP responses (JSON compresses roughly 5-10x).
+app.use(compression());
 const server = http.createServer(app);
 const io = new SocketIOServer(server, {
   cors: {
     origin: "*",
   },
+  // Compress WebSocket frames over 1 KB (mainly GAME_SCORE_UPDATED, which
+  // carries the whole match state on every ball). Negotiated per
+  // connection, so clients that don't support it still work uncompressed.
+  // No context takeover keeps per-connection memory low on a small instance.
+  perMessageDeflate: {
+    threshold: 1024,
+    serverNoContextTakeover: true,
+    clientNoContextTakeover: true,
+  },
 });
 setSocketServer(io);
 
-const broadcastActiveUsersCount = (): void => {
-  io.emit(
-    SocketIOEvents.ACTIVE_USERS_COUNT,
-    JSON.stringify({ count: io.engine.clientsCount }),
-  );
+// Only the home page shows the active-users count, so it's sent only to
+// sockets that announced HOME_PAGE_VIEW (they join this room), not to every
+// scorer/viewer connection. Connect/disconnect bursts are coalesced into at
+// most one broadcast per interval instead of one per event -- previously
+// every join/leave sent a message to every connected client.
+const HOME_VIEWERS_ROOM = "home-viewers";
+const ACTIVE_USERS_BROADCAST_INTERVAL_MS = 15_000;
+let activeUsersBroadcastTimer: NodeJS.Timeout | null = null;
+
+const getActiveUsersCountPayload = (): string =>
+  JSON.stringify({ count: io.engine.clientsCount });
+
+const scheduleActiveUsersCountBroadcast = (): void => {
+  if (activeUsersBroadcastTimer) return;
+  activeUsersBroadcastTimer = setTimeout(() => {
+    activeUsersBroadcastTimer = null;
+    io.to(HOME_VIEWERS_ROOM).emit(
+      SocketIOEvents.ACTIVE_USERS_COUNT,
+      getActiveUsersCountPayload(),
+    );
+  }, ACTIVE_USERS_BROADCAST_INTERVAL_MS);
 };
 
 app.get("/", (req: Request, res: Response) => {
@@ -237,7 +265,7 @@ app.use("/api/v1/analytics", analyticsRoutes);
 
 io.on("connection", (socket: Socket) => {
   socket.id && console.log(`New client connected: ${socket.id}`);
-  broadcastActiveUsersCount();
+  scheduleActiveUsersCountBroadcast();
   // On game join
   socket.on(SocketIOClientEvents.GAME_JOIN, (roomID: string) => {
     socket.join(roomID);
@@ -282,8 +310,13 @@ io.on("connection", (socket: Socket) => {
 
   // On home page view, send all running matches
   socket.on(SocketIOClientEvents.HOME_PAGE_VIEW, () => {
+    socket.join(HOME_VIEWERS_ROOM);
     const liveUpdates = getLiveUpdatesPayload();
     socket.emit(SocketIOEvents.LIVE_UPDATES, JSON.stringify(liveUpdates));
+    socket.emit(
+      SocketIOEvents.ACTIVE_USERS_COUNT,
+      getActiveUsersCountPayload(),
+    );
   });
 
   socket.on("disconnect", (reason) => {
@@ -295,7 +328,7 @@ io.on("connection", (socket: Socket) => {
     }
     gameScoresClient.delete(socket.id);
     console.log(`Client disconnected: ${socket.id}, reason: ${reason}`);
-    broadcastActiveUsersCount();
+    scheduleActiveUsersCountBroadcast();
   });
 });
 

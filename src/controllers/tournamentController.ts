@@ -30,6 +30,7 @@ import {
 } from "../models/SavedPlayerTeam";
 import { trackEvent } from "../utils/analytics";
 import { parsePagination, buildPaginationMeta } from "../utils/pagination";
+import { toSummarySnapshot, wantsSummaryView } from "../utils/snapshotSummary";
 
 const normalizeText = (value: unknown) =>
   typeof value === "string" ? value.trim() : "";
@@ -775,6 +776,10 @@ const serializeTournament = async (
   tournament: ITournament,
   userId: string,
   includeDetails = false,
+  // true -> each match's snapshot is trimmed to what the tournament screens
+  // display (see utils/snapshotSummary.ts). Only set for GET requests that
+  // pass ?view=summary, so every other caller gets the full snapshot.
+  summarySnapshots = false,
 ) => {
   const teams = includeDetails
     ? await getTournamentTeamDocs(tournament._id as Types.ObjectId, userId)
@@ -805,7 +810,12 @@ const serializeTournament = async (
     status: tournament.status,
     teamsCount,
     teams: teams.map(serializeTeam),
-    matches: matches.map((match) => serializeMatch(match, teamById)),
+    matches: matches.map((match) => {
+      const serialized = serializeMatch(match, teamById);
+      return summarySnapshots
+        ? { ...serialized, snapshot: toSummarySnapshot(serialized.snapshot) }
+        : serialized;
+    }),
     createdAt: tournament.createdAt,
     updatedAt: tournament.updatedAt,
   };
@@ -1075,10 +1085,11 @@ export const getTournaments = async (
         .limit(pagination.limit),
     ]);
 
+    const summarySnapshots = wantsSummaryView(req.query);
     res.status(200).json({
       tournaments: await Promise.all(
         tournaments.map((tournament) =>
-          serializeTournament(tournament, userId, true),
+          serializeTournament(tournament, userId, true, summarySnapshots),
         ),
       ),
       pagination: buildPaginationMeta(total, pagination),
@@ -1110,7 +1121,12 @@ export const getTournament = async (
     await syncMissingTeamLogos(teams);
 
     res.status(200).json({
-      tournament: await serializeTournament(tournament, userId, true),
+      tournament: await serializeTournament(
+        tournament,
+        userId,
+        true,
+        wantsSummaryView(req.query),
+      ),
       teams: teams.map(serializeTeam),
     });
   } catch (error) {
