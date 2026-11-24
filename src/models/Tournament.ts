@@ -18,6 +18,9 @@ export interface ITournament extends Document {
   endDate: Date;
   location: string;
   logoUrl?: string;
+  /** Uploaded logo (data: URL), served at GET /tournaments/:id/logo. */
+  logoData?: string;
+  logoVersion?: number;
   ballType: BallType;
   customBallType?: string;
   oversPerMatch: number;
@@ -63,6 +66,8 @@ const tournamentSchema = new Schema<ITournament>(
       type: String,
       trim: true,
     },
+    logoData: { type: String, select: false },
+    logoVersion: { type: Number, default: 0 },
     ballType: {
       type: String,
       enum: BALL_TYPES,

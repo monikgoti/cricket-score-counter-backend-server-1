@@ -29,6 +29,11 @@ import {
   type ISavedPlayerTeam,
 } from "../models/SavedPlayerTeam";
 import { trackEvent } from "../utils/analytics";
+import { sendImageDataUrl, validateImageDataUrl } from "../utils/imageData";
+import { ensureLiveCodes } from "../utils/liveCode";
+import { deleteBlobQuietly, isBlobStorageEnabled, isBlobUrl, putImageDataUrl } from "../utils/blobStorage";
+import { normalizeLogoLink } from "./mediaController";
+import { notifyAddedPlayers, resolveLiveIdentity } from "../utils/players";
 import { parsePagination, buildPaginationMeta } from "../utils/pagination";
 import { toSummarySnapshot, wantsSummaryView } from "../utils/snapshotSummary";
 
@@ -120,6 +125,117 @@ const normalizePlayers = (players: unknown): ITournamentPlayer[] => {
   });
 
   return normalizedPlayers;
+};
+
+/**
+ * Points roster entries at live player profiles: follows claim merges, drops
+ * ids that no longer exist, and fills the username from the profile.
+ */
+const resolveRosterIdentities = async (
+  players: ITournamentPlayer[],
+): Promise<ITournamentPlayer[]> =>
+  Promise.all(
+    players.map(async (player) => {
+      if (!player.playerId) return player;
+      const identity = await resolveLiveIdentity(player.playerId);
+      if (!identity) return { ...player, playerId: undefined, username: undefined };
+      return {
+        ...player,
+        playerId: identity._id as Types.ObjectId,
+        username: identity.username,
+      };
+    }),
+  );
+
+const notifySquadAdditions = async (
+  previousIds: Set<string>,
+  team: ITournamentTeam,
+  tournament: ITournament,
+  userId: string,
+) =>
+  notifyAddedPlayers(previousIds, team.players.map((p) => p.playerId), userId, {
+    type: "squad_added",
+    title: `You're in the ${team.name} squad`,
+    body: `${tournament.organizerName || "The organizer"} added you to ${team.name} for ${tournament.name}.`,
+    link: `/tournaments/${String(tournament._id)}`,
+    data: { tournamentId: String(tournament._id), teamId: String(team._id) },
+  });
+
+const tournamentLogoPath = (tournamentId: unknown, version: number) =>
+  `/api/v1/tournaments/${String(tournamentId)}/logo?v=${version}`;
+
+/**
+ * Applies logo changes from a create/update body:
+ *  - logoData: a data: URL upload, or null/"" to remove the logo. With Vercel
+ *    Blob configured it goes to Blob and logoUrl becomes the CDN link;
+ *    otherwise it's stored on the tournament and served from our endpoint;
+ *  - logoUrl: an external image link (replaces any uploaded logo). Our own
+ *    uploaded logo coming back unchanged from an edit form is ignored.
+ * Returns an error message (or "") and the Blob file this change replaced,
+ * which the caller deletes once the tournament is saved.
+ */
+const applyTournamentLogo = async (
+  tournament: ITournament,
+  body: any,
+): Promise<{ problem: string; replacedBlobUrl?: string }> => {
+  const previous = isBlobUrl(tournament.logoUrl) ? tournament.logoUrl : undefined;
+  if (body?.logoData !== undefined) {
+    if (body.logoData === null || body.logoData === "") {
+      tournament.logoData = undefined;
+      tournament.logoVersion = 0;
+      tournament.logoUrl = undefined;
+      return { problem: "", replacedBlobUrl: previous };
+    }
+    const problem = validateImageDataUrl(body.logoData);
+    if (problem) return { problem };
+    if (isBlobStorageEnabled()) {
+      const url = await putImageDataUrl(body.logoData, `tournament-logos/${String(tournament._id)}`);
+      tournament.logoData = undefined;
+      tournament.logoVersion = 0;
+      tournament.logoUrl = url;
+      return { problem: "", replacedBlobUrl: previous !== url ? previous : undefined };
+    }
+    tournament.logoData = body.logoData;
+    tournament.logoVersion = Date.now();
+    tournament.logoUrl = tournamentLogoPath(tournament._id, tournament.logoVersion);
+    return { problem: "", replacedBlobUrl: previous };
+  }
+  if (body?.logoUrl !== undefined) {
+    const url = normalizeOptionalText(body.logoUrl);
+    const isOwnUpload = Boolean(
+      url && (url.includes(`/api/v1/tournaments/${String(tournament._id)}/logo`) || url === tournament.logoUrl),
+    );
+    if (!isOwnUpload) {
+      if (url && !/^https?:\/\//i.test(url)) return { problem: "Logo link must start with http:// or https://" };
+      tournament.logoUrl = url;
+      tournament.logoData = undefined;
+      tournament.logoVersion = 0;
+      return { problem: "", replacedBlobUrl: previous };
+    }
+  }
+  return { problem: "" };
+};
+
+/** GET /tournaments/:tournamentId/logo — public, cacheable. */
+export const getTournamentLogo = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const id = normalizeText(req.params.tournamentId);
+    if (!Types.ObjectId.isValid(id)) {
+      res.status(404).end();
+      return;
+    }
+    const tournament = await Tournament.findById(id).select("+logoData logoUrl").lean();
+    if (!tournament?.logoData && isBlobUrl(tournament?.logoUrl)) {
+      // Moved to Vercel Blob: send old links on to the CDN copy.
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.redirect(301, tournament.logoUrl);
+      return;
+    }
+    sendImageDataUrl(res, tournament?.logoData);
+  } catch (error) {
+    console.error("Get tournament logo error", error);
+    res.status(500).end();
+  }
 };
 
 const defaultStatistics = (): ITeamStatistics => ({
@@ -744,6 +860,7 @@ const serializeMatch = (
   return {
     id: String(match._id),
     tournamentId: String(match.tournament),
+    liveCode: match.liveCode ?? "",
     team1Id,
     team2Id,
     team1Name: teamById.get(team1Id)?.name ?? "",
@@ -787,6 +904,7 @@ const serializeTournament = async (
   const matches = includeDetails
     ? await getTournamentMatches(tournament._id as Types.ObjectId, userId)
     : [];
+  await ensureLiveCodes(matches);
   const teamsCount = includeDetails
     ? teams.length
     : await TournamentTeam.countDocuments({
@@ -935,7 +1053,7 @@ const applyMatchStatsToTeams = (
   addPlayerScorecardStats(team2, playerScorecards[team2.name]);
 };
 
-const recalculateTournamentStatistics = async (
+export const recalculateTournamentStatistics = async (
   tournamentId: Types.ObjectId,
   userId: string,
 ): Promise<ITournamentTeam[]> => {
@@ -1020,14 +1138,13 @@ export const createTournament = async (
       return;
     }
 
-    const tournament = await Tournament.create({
+    const tournament = new Tournament({
       organizer: new Types.ObjectId(userId),
       name,
       organizerName,
       startDate,
       endDate,
       location,
-      logoUrl: normalizeOptionalText(req.body?.logoUrl),
       ballType,
       customBallType:
         ballType === "custom"
@@ -1038,6 +1155,12 @@ export const createTournament = async (
       squadMode,
       status: "draft",
     });
+    const logo = await applyTournamentLogo(tournament, req.body);
+    if (logo.problem) {
+      res.status(400).json({ message: logo.problem });
+      return;
+    }
+    await tournament.save();
 
     trackEvent(req, {
       type: "TOURNAMENT_CREATED",
@@ -1068,6 +1191,14 @@ export const getTournaments = async (
 
     if (isTournamentStatus(req.query.status)) {
       query.status = req.query.status;
+    }
+
+    // ?q= searches the organizer's own tournaments by name, location or
+    // organizer name (case-insensitive, matches anywhere in the text).
+    const search = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 60) : "";
+    if (search) {
+      const pattern = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      query.$or = [{ name: pattern }, { location: pattern }, { organizerName: pattern }];
     }
 
     // GET /api/v1/tournaments?page=1&limit=20 -- page/limit are optional;
@@ -1157,8 +1288,10 @@ export const updateTournament = async (
     if (req.body?.location !== undefined) {
       updates.location = normalizeText(req.body.location);
     }
-    if (req.body?.logoUrl !== undefined) {
-      updates.logoUrl = normalizeOptionalText(req.body.logoUrl);
+    const logo = await applyTournamentLogo(tournament, req.body);
+    if (logo.problem) {
+      res.status(400).json({ message: logo.problem });
+      return;
     }
     if (req.body?.oversPerMatch !== undefined) {
       const oversPerMatch = parsePositiveNumber(req.body.oversPerMatch);
@@ -1233,6 +1366,7 @@ export const updateTournament = async (
 
     Object.assign(tournament, updates);
     await tournament.save();
+    void deleteBlobQuietly(logo.replacedBlobUrl);
 
     res.status(200).json({
       tournament: await serializeTournament(tournament, userId, true),
@@ -1260,6 +1394,7 @@ export const deleteTournament = async (
     await TournamentMatch.deleteMany({ tournament: tournament._id });
     await TournamentTeam.deleteMany({ tournament: tournament._id });
     await tournament.deleteOne();
+    void deleteBlobQuietly(tournament.logoUrl);
 
     res.status(200).json({ message: "Tournament deleted" });
   } catch (error) {
@@ -1307,10 +1442,12 @@ export const createTournamentTeam = async (
       normalizeText(req.body?.contactNumber) ||
       sourceTeam?.contactNumber ||
       (sourceTeam ? "N/A" : "");
-    const players = normalizePlayers(
-      Array.isArray(req.body?.players) && req.body.players.length
-        ? req.body.players
-        : sourcePlayers,
+    const players = await resolveRosterIdentities(
+      normalizePlayers(
+        Array.isArray(req.body?.players) && req.body.players.length
+          ? req.body.players
+          : sourcePlayers,
+      ),
     );
 
     if (!name || !captainName || !contactNumber) {
@@ -1331,12 +1468,13 @@ export const createTournamentTeam = async (
       organizer: new Types.ObjectId(userId),
       sourceTeamId: sourceTeam?._id,
       name,
-      logoUrl: normalizeOptionalText(req.body?.logoUrl) ?? sourceTeam?.logoUrl,
+      logoUrl: normalizeLogoLink(normalizeOptionalText(req.body?.logoUrl)) ?? sourceTeam?.logoUrl,
       captainName,
       contactNumber,
       players,
       statistics: normalizeStatistics(req.body?.statistics),
     });
+    await notifySquadAdditions(new Set(), team, tournament, userId);
 
     res.status(201).json({ team: serializeTeam(team) });
   } catch (error: any) {
@@ -1404,6 +1542,7 @@ export const getTournamentMatchesList = async (
       getTournamentTeamDocs(tournament._id as Types.ObjectId, userId),
       TournamentMatch.find(query).sort({ completedAt: -1, createdAt: -1 }),
     ]);
+    await ensureLiveCodes(matches);
     const teamById = new Map(teams.map((team) => [String(team._id), team]));
 
     res.status(200).json({
@@ -1470,7 +1609,7 @@ export const updateTournamentTeam = async (
 
     if (req.body?.name !== undefined) team.name = normalizeText(req.body.name);
     if (req.body?.logoUrl !== undefined) {
-      team.logoUrl = normalizeOptionalText(req.body.logoUrl);
+      team.logoUrl = normalizeLogoLink(normalizeOptionalText(req.body.logoUrl));
     }
     if (req.body?.captainName !== undefined) {
       team.captainName = normalizeText(req.body.captainName);
@@ -1478,8 +1617,11 @@ export const updateTournamentTeam = async (
     if (req.body?.contactNumber !== undefined) {
       team.contactNumber = normalizeText(req.body.contactNumber);
     }
+    const previousPlayerIds = new Set(
+      team.players.filter((p) => p.playerId).map((p) => String(p.playerId)),
+    );
     if (req.body?.players !== undefined) {
-      const players = normalizePlayers(req.body.players);
+      const players = await resolveRosterIdentities(normalizePlayers(req.body.players));
       if ((tournament.squadMode ?? "teams_only") === "with_players" && !players.length) {
         res.status(400).json({
           message: "At least one player is required for this tournament",
@@ -1502,6 +1644,7 @@ export const updateTournamentTeam = async (
     }
 
     await team.save();
+    await notifySquadAdditions(previousPlayerIds, team, tournament, userId);
 
     res.status(200).json({ team: serializeTeam(team) });
   } catch (error: any) {

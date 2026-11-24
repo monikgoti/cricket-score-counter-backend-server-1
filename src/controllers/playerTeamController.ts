@@ -9,6 +9,8 @@ import {
 } from "../models/SavedPlayerTeam";
 import { TournamentTeam } from "../models/TournamentTeam";
 import { Tournament } from "../models/Tournament";
+import { notifyAddedPlayers, resolveLiveIdentity, serializePublicPlayer } from "../utils/players";
+import { normalizeLogoLink } from "./mediaController";
 
 const MIN_TEAM_PLAYERS = 8;
 
@@ -45,12 +47,9 @@ const ensureUniqueUsername = async (name: string) => {
   return username;
 };
 
+// Public listing: never exposes phone numbers or hidden/claimed-away records.
 const serializePlayerIdentity = (player: IPlayerIdentity) => ({
-  id: String(player._id),
-  name: player.name,
-  username: player.username,
-  role: player.role ?? "",
-  contactNumber: player.contactNumber ?? "",
+  ...serializePublicPlayer(player),
   createdAt: player.createdAt,
   updatedAt: player.updatedAt,
 });
@@ -121,8 +120,13 @@ const resolveSavedTeamPlayers = async (
     let identity: IPlayerIdentity | null = null;
 
     if (Types.ObjectId.isValid(requestedPlayerId)) {
-      identity = await PlayerIdentity.findById(requestedPlayerId);
+      // Follow claims: an old record id resolves to the player's own profile.
+      identity = await resolveLiveIdentity(requestedPlayerId);
     }
+    // Only the organizer who created an unclaimed record may edit it. A
+    // registered player's profile is theirs alone; organizers just link it.
+    const canEditIdentity =
+      !!identity && !identity.user && String(identity.createdBy) === userId;
 
     if (!identity) {
       const username = await ensureUniqueUsername(name);
@@ -133,7 +137,7 @@ const resolveSavedTeamPlayers = async (
         role,
         contactNumber: normalizeOptionalText(record.contactNumber),
       });
-    } else {
+    } else if (canEditIdentity) {
       const contactNumber = normalizeOptionalText(record.contactNumber);
       let changed = false;
       if (identity.name !== name) {
@@ -153,13 +157,17 @@ const resolveSavedTeamPlayers = async (
 
     players.push({
       playerId: identity._id as Types.ObjectId,
-      name: identity.name,
+      // The roster keeps the name the organizer uses for this team: past
+      // scorecards are matched by it. The player's own profile is untouched.
+      name,
       username: identity.username,
       role:
         role ??
         (savedPlayerIndex !== 0 && !requestedRole ? identity.role : undefined),
+      // Never copy a registered player's private contact into someone's team.
       contactNumber:
-        normalizeOptionalText(record.contactNumber) ?? identity.contactNumber,
+        normalizeOptionalText(record.contactNumber) ??
+        (identity.user ? undefined : identity.contactNumber),
     });
   }
 
@@ -181,6 +189,9 @@ const syncLinkedTournamentTeams = async (
 
   await Promise.all(
     linkedTeams.map(async (tournamentTeam) => {
+      const previousIds = new Set(
+        tournamentTeam.players.filter((p) => p.playerId).map((p) => String(p.playerId)),
+      );
       tournamentTeam.name = team.name;
       if (team.logoUrl) tournamentTeam.logoUrl = team.logoUrl;
       if (team.captainName) tournamentTeam.captainName = team.captainName;
@@ -228,6 +239,18 @@ const syncLinkedTournamentTeams = async (
       ] as typeof tournamentTeam.players;
 
       await tournamentTeam.save();
+      const tournament = await Tournament.findById(tournamentTeam.tournament).select("name").lean();
+      await notifyAddedPlayers(
+        previousIds,
+        tournamentTeam.players.map((p) => p.playerId),
+        String(team.owner),
+        {
+          type: "squad_added",
+          title: `You're in the ${tournamentTeam.name} squad`,
+          body: `You were added to ${tournamentTeam.name}${tournament ? ` for ${tournament.name}` : ""}.`,
+          link: `/tournaments/${String(tournamentTeam.tournament)}`,
+        },
+      );
     }),
   );
 };
@@ -312,10 +335,16 @@ export const createSavedPlayerTeam = async (
     const team = await SavedPlayerTeam.create({
       owner: new Types.ObjectId(req.user.id),
       name,
-      logoUrl: normalizeOptionalText(req.body?.logoUrl),
+      logoUrl: normalizeLogoLink(normalizeOptionalText(req.body?.logoUrl)),
       captainName,
       contactNumber,
       players,
+    });
+    await notifyAddedPlayers(new Set(), team.players.map((p) => p.playerId), req.user.id, {
+      type: "team_added",
+      title: `You were added to ${team.name}`,
+      body: `${req.user.name || "An organizer"} added you to the team ${team.name}.`,
+      link: "/me",
     });
 
     res.status(201).json({ team: serializeSavedTeam(team) });
@@ -350,7 +379,7 @@ export const updateSavedPlayerTeam = async (
 
     if (req.body?.name !== undefined) team.name = normalizeText(req.body.name);
     if (req.body?.logoUrl !== undefined) {
-      team.logoUrl = normalizeOptionalText(req.body.logoUrl);
+      team.logoUrl = normalizeLogoLink(normalizeOptionalText(req.body.logoUrl));
     }
     if (req.body?.captainName !== undefined) {
       team.captainName = normalizeText(req.body.captainName);
@@ -358,6 +387,7 @@ export const updateSavedPlayerTeam = async (
     if (req.body?.contactNumber !== undefined) {
       team.contactNumber = normalizeText(req.body.contactNumber);
     }
+    const previousPlayerIds = new Set(team.players.map((p) => String(p.playerId)));
     if (req.body?.players !== undefined) {
       const players = await resolveSavedTeamPlayers(req.body.players, req.user.id);
       if (!players[0]?.name) {
@@ -390,6 +420,12 @@ export const updateSavedPlayerTeam = async (
     }
 
     await team.save();
+    await notifyAddedPlayers(previousPlayerIds, team.players.map((p) => p.playerId), req.user.id, {
+      type: "team_added",
+      title: `You were added to ${team.name}`,
+      body: `${req.user.name || "An organizer"} added you to the team ${team.name}.`,
+      link: "/me",
+    });
     await syncLinkedTournamentTeams(team);
     res.status(200).json({ team: serializeSavedTeam(team) });
   } catch (error: any) {
@@ -464,11 +500,14 @@ export const getPublicPlayers = async (
 ): Promise<void> => {
   try {
     const q = normalizeText(req.query.q);
-    const query: Record<string, unknown> = {};
+    const query: Record<string, unknown> = {
+      visibility: { $ne: "hidden" },
+      mergedInto: { $exists: false },
+    };
     if (q) {
       query.$or = [
-        { name: { $regex: q, $options: "i" } },
-        { username: { $regex: q, $options: "i" } },
+        { name: { $regex: escapeRegExp(q), $options: "i" } },
+        { username: { $regex: escapeRegExp(q), $options: "i" } },
       ];
     }
 

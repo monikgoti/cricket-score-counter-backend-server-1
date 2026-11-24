@@ -22,6 +22,8 @@ export interface ITournamentMatch extends Document {
   winnerTeam?: Types.ObjectId;
   resultText?: string;
   scorerMatchId?: string;
+  /** Permanent code for the public live-watch link (/join-game/<code>). */
+  liveCode?: string;
   snapshot?: unknown;
   startedAt?: Date;
   completedAt?: Date;
@@ -87,6 +89,10 @@ const tournamentMatchSchema = new Schema<ITournamentMatch>(
       type: String,
       trim: true,
     },
+    liveCode: {
+      type: String,
+      trim: true,
+    },
     snapshot: {
       type: Schema.Types.Mixed,
     },
@@ -104,6 +110,18 @@ const tournamentMatchSchema = new Schema<ITournamentMatch>(
 
 tournamentMatchSchema.index({ tournament: 1, pairKey: 1, status: 1 });
 tournamentMatchSchema.index({ tournament: 1, createdAt: -1 });
+tournamentMatchSchema.index({ liveCode: 1 }, { unique: true, sparse: true });
+
+// Every match gets its permanent live-watch code when it's first saved.
+tournamentMatchSchema.pre("save", function () {
+  if (!this.liveCode) {
+    // Inline to avoid a circular import with utils/liveCode.
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let code = "T";
+    for (let i = 0; i < 6; i += 1) code += alphabet[Math.floor(Math.random() * alphabet.length)];
+    this.liveCode = code;
+  }
+});
 
 export const TournamentMatch = model<ITournamentMatch>(
   "TournamentMatch",

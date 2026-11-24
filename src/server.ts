@@ -6,6 +6,10 @@ import * as http from "http";
 import { connectDatabase } from "./config/database";
 import analyticsRoutes from "./routes/analyticsRoutes";
 import authRoutes from "./routes/authRoutes";
+import meRoutes from "./routes/meRoutes";
+import mediaRoutes from "./routes/mediaRoutes";
+import liveRoutes from "./routes/liveRoutes";
+import adminRoutes from "./routes/adminRoutes";
 import playerRoutes from "./routes/playerRoutes";
 import playerTeamRoutes from "./routes/playerTeamRoutes";
 import promoBannerRoutes from "./routes/promoBannerRoutes";
@@ -231,6 +235,61 @@ const scheduleActiveUsersCountBroadcast = (): void => {
   }, ACTIVE_USERS_BROADCAST_INTERVAL_MS);
 };
 
+// Live score broadcasts. The scorer sends the whole match state on every
+// change; we pass it on to the match's viewers only:
+//  - never back to the scorer who sent it (it doesn't use the copy, and with
+//    no viewers that echo was the only thing being sent), and
+//  - at most once a second per match. A burst of changes (undo, picking the
+//    next batter and bowler) goes out as one message carrying the latest
+//    state, so viewers are never more than a second behind and always end
+//    on the final state.
+const GAME_BROADCAST_INTERVAL_MS = 1_000;
+const lastGameBroadcastAt = new Map<string, number>();
+const pendingGameBroadcasts = new Map<string, NodeJS.Timeout>();
+const lastGameSender = new Map<string, string>();
+
+const sendGameScoreToViewers = (gameId: string): void => {
+  lastGameBroadcastAt.set(gameId, Date.now());
+  const state = gameScores.get(gameId);
+  if (!state) return;
+  const room = io.sockets.adapter.rooms.get(gameId);
+  const senderId = lastGameSender.get(gameId);
+  const viewers = room ? room.size - (senderId && room.has(senderId) ? 1 : 0) : 0;
+  if (viewers <= 0) return;
+  const broadcast = senderId ? io.to(gameId).except(senderId) : io.to(gameId);
+  broadcast.emit(SocketIOEvents.GAME_SCORE_UPDATED, JSON.stringify(state));
+};
+
+const scheduleGameScoreBroadcast = (gameId: string, senderId: string): void => {
+  lastGameSender.set(gameId, senderId);
+  if (pendingGameBroadcasts.has(gameId)) return; // the pending send picks up the latest state
+  const wait = GAME_BROADCAST_INTERVAL_MS - (Date.now() - (lastGameBroadcastAt.get(gameId) ?? 0));
+  if (wait <= 0) {
+    sendGameScoreToViewers(gameId);
+    return;
+  }
+  pendingGameBroadcasts.set(
+    gameId,
+    setTimeout(() => {
+      pendingGameBroadcasts.delete(gameId);
+      sendGameScoreToViewers(gameId);
+    }, wait),
+  );
+};
+
+const forgetGame = (gameId: string): void => {
+  const pending = pendingGameBroadcasts.get(gameId);
+  if (pending) {
+    // Deliver the final state (e.g. the winning ball) before letting go.
+    clearTimeout(pending);
+    pendingGameBroadcasts.delete(gameId);
+    sendGameScoreToViewers(gameId);
+  }
+  gameScores.delete(gameId);
+  lastGameBroadcastAt.delete(gameId);
+  lastGameSender.delete(gameId);
+};
+
 app.get("/", (req: Request, res: Response) => {
   res.send("Socket.IO server is running!");
 });
@@ -255,6 +314,10 @@ app.use((req: Request, res: Response, next) => {
 });
 app.use("/api/v1/auth", authRoutes);
 app.use("/api/v1/players", playerRoutes);
+app.use("/api/v1/me", meRoutes);
+app.use("/api/v1/media", mediaRoutes);
+app.use("/api/v1/live", liveRoutes);
+app.use("/api/v1/admin", adminRoutes);
 app.use("/api/v1/player-teams", playerTeamRoutes);
 app.use("/api/v1/promo-banner", promoBannerRoutes);
 app.use("/api/v1/public-players", publicPlayerRoutes);
@@ -281,7 +344,7 @@ io.on("connection", (socket: Socket) => {
   socket.on(SocketIOClientEvents.GAME_END, (roomID: string) => {
     socket.leave(roomID);
     if (gameScores.has(roomID)) {
-      gameScores.delete(roomID);
+      forgetGame(roomID);
       gameScoresClient.delete(socket.id);
     }
   });
@@ -294,10 +357,7 @@ io.on("connection", (socket: Socket) => {
       if (gameId) {
         gameScores.set(gameId, data);
         gameScoresClient.set(socket.id, gameId);
-        io.to(gameId).emit(
-          SocketIOEvents.GAME_SCORE_UPDATED,
-          JSON.stringify(data),
-        );
+        scheduleGameScoreBroadcast(gameId, socket.id);
       }
     },
   );
@@ -321,10 +381,8 @@ io.on("connection", (socket: Socket) => {
 
   socket.on("disconnect", (reason) => {
     const gameId = gameScoresClient.get(socket.id);
-    console.log("gameScoresClient", gameScoresClient);
-    console.log("gameId", gameId);
     if (gameId) {
-      gameScores.delete(gameId);
+      forgetGame(gameId);
     }
     gameScoresClient.delete(socket.id);
     console.log(`Client disconnected: ${socket.id}, reason: ${reason}`);

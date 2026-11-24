@@ -6,6 +6,7 @@ import {
   deleteTournament,
   deleteTournamentTeam,
   getTournament,
+  getTournamentLogo,
   getTournamentMatchesList,
   getTournaments,
   getTournamentTeams,
@@ -17,12 +18,14 @@ import {
   updateTournamentTeamStatistics,
 } from "../controllers/tournamentController";
 import { requireAuth } from "../middleware/authMiddleware";
+import { getTournamentPlayerStats } from "../controllers/playerStatsController";
 
 const router = Router();
 
 router.get("/", requireAuth, getTournaments);
 router.post("/", requireAuth, createTournament);
 router.get("/:tournamentId", requireAuth, getTournament);
+router.get("/:tournamentId/logo", getTournamentLogo);
 router.patch("/:tournamentId", requireAuth, updateTournament);
 router.put("/:tournamentId", requireAuth, updateTournament);
 router.delete("/:tournamentId", requireAuth, deleteTournament);
@@ -60,6 +63,7 @@ router.post(
 );
 
 router.get("/:tournamentId/matches", requireAuth, getTournamentMatchesList);
+router.get("/:tournamentId/player-stats", requireAuth, getTournamentPlayerStats);
 router.post("/:tournamentId/matches/start", requireAuth, startTournamentMatch);
 router.post(
   "/:tournamentId/matches/complete",

@@ -12,6 +12,10 @@ import { Tournament } from "../models/Tournament";
 import { TournamentMatch } from "../models/TournamentMatch";
 import { TournamentTeam } from "../models/TournamentTeam";
 import { User } from "../models/User";
+import { MediaImage } from "../models/MediaImage";
+import { Notification } from "../models/Notification";
+import { PlayerClaimRequest } from "../models/PlayerClaimRequest";
+import { deleteBlobQuietly, isBlobUrl } from "../utils/blobStorage";
 import { verifyTokenWithRefresh } from "../utils/jwt";
 import { revokeAppleToken } from "../utils/appleAuth";
 
@@ -44,6 +48,11 @@ const getBearerToken = (req: Request): string | null => {
 
 export type AccountDeletionCounts = Record<string, number>;
 
+// Blob file URLs collected while deleting a user's data, removed from
+// Vercel Blob after the database deletion has committed (a transaction can
+// retry, and files can't be put back).
+const pendingBlobDeletes = new Map<string, string[]>();
+
 /**
  * Hard-deletes a user and every document they own. Nothing is soft-deleted
  * or anonymised: documents are physically removed.
@@ -63,9 +72,12 @@ export const hardDeleteUserData = async (
   // Tournaments the user organised, plus every team and fixture in them
   // (matched by tournament id too, in case an older child doc has a
   // different organizer value).
-  const tournamentIds = (
-    await Tournament.find({ organizer: userId }, { _id: 1 }, opts).lean()
-  ).map((tournament) => tournament._id);
+  const ownTournaments = await Tournament.find({ organizer: userId }, { _id: 1, logoUrl: 1 }, opts).lean();
+  const tournamentIds = ownTournaments.map((tournament) => tournament._id);
+  // Image files on Vercel Blob are removed once the database part succeeds.
+  const blobUrls: string[] = ownTournaments
+    .map((tournament) => tournament.logoUrl)
+    .filter((url): url is string => isBlobUrl(url));
   const inUsersTournaments = {
     $or: [{ organizer: userId }, { tournament: { $in: tournamentIds } }],
   };
@@ -87,6 +99,38 @@ export const hardDeleteUserData = async (
   counts.playerIdentities = (
     await PlayerIdentity.deleteMany({ createdBy: userId }, opts)
   ).deletedCount;
+  // A record someone else created that this user claimed goes back to being
+  // that organizer's plain record: the personal details they added are erased.
+  counts.claimedPlayerProfilesReleased = (
+    await PlayerIdentity.updateMany(
+      { user: userId },
+      {
+        $unset: {
+          user: 1,
+          claimedAt: 1,
+          avatarData: 1,
+          city: 1,
+          battingStyle: 1,
+          bowlingStyle: 1,
+          suspendedAt: 1,
+          visibilityBeforeSuspension: 1,
+        },
+        $set: { visibility: "public", avatarVersion: 0 },
+      },
+      opts,
+    )
+  ).modifiedCount;
+  counts.playerClaimRequests = (
+    await PlayerClaimRequest.deleteMany({ $or: [{ requester: userId }, { approver: userId }] }, opts)
+  ).deletedCount;
+  counts.notifications = (await Notification.deleteMany({ user: userId }, opts)).deletedCount;
+
+  // Uploaded images (team logos).
+  const images = await MediaImage.find({ owner: userId }, { url: 1 }, opts).lean();
+  images.forEach((image) => {
+    if (isBlobUrl(image.url)) blobUrls.push(image.url);
+  });
+  counts.mediaImages = (await MediaImage.deleteMany({ owner: userId }, opts)).deletedCount;
   counts.players = (await Player.deleteMany({ user: userId }, opts))
     .deletedCount;
 
@@ -131,6 +175,8 @@ export const hardDeleteUserData = async (
   // The user record itself goes last.
   counts.users = (await User.deleteOne({ _id: userId }, opts)).deletedCount;
 
+  counts.blobFiles = blobUrls.length;
+  pendingBlobDeletes.set(String(userId), blobUrls);
   return counts;
 };
 
@@ -237,6 +283,9 @@ export const deleteAccount = async (
     }
 
     attemptsByUser.delete(userId);
+    const blobs = pendingBlobDeletes.get(String(target._id)) ?? [];
+    pendingBlobDeletes.delete(String(target._id));
+    blobs.forEach((url) => void deleteBlobQuietly(url));
     // Audit log: id and counts only - never email, name or password.
     console.info("Account deleted", {
       userId,
