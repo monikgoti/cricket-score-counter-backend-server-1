@@ -7,11 +7,13 @@ import {
   TOURNAMENT_FORMATS,
   TOURNAMENT_SQUAD_MODES,
   TOURNAMENT_STATUSES,
+  TOURNAMENT_VISIBILITIES,
   type BallType,
   type ITournament,
   type TournamentFormat,
   type TournamentSquadMode,
   type TournamentStatus,
+  type TournamentVisibility,
 } from "../models/Tournament";
 import {
   TournamentMatch,
@@ -74,6 +76,9 @@ const isBallType = (value: unknown): value is BallType =>
 const isTournamentStatus = (value: unknown): value is TournamentStatus =>
   typeof value === "string" &&
   TOURNAMENT_STATUSES.includes(value as TournamentStatus);
+
+const isTournamentVisibility = (value: unknown): value is TournamentVisibility =>
+  TOURNAMENT_VISIBILITIES.includes(value as TournamentVisibility);
 
 const isTournamentSquadMode = (value: unknown): value is TournamentSquadMode =>
   typeof value === "string" &&
@@ -843,7 +848,7 @@ const resolveTournamentMatchFromSavedMatchPayload = async (
   return tournament ? { tournament, match } : null;
 };
 
-const serializeMatch = (
+export const serializeMatch = (
   match: ITournamentMatch,
   teamById: Map<string, ITournamentTeam>,
 ) => {
@@ -925,6 +930,7 @@ const serializeTournament = async (
     oversPerMatch: tournament.oversPerMatch,
     format: tournament.format,
     squadMode: tournament.squadMode ?? "teams_only",
+    visibility: tournament.visibility ?? "public",
     status: tournament.status,
     teamsCount,
     teams: teams.map(serializeTeam),
@@ -939,7 +945,7 @@ const serializeTournament = async (
   };
 };
 
-const serializeTeam = (team: ITournamentTeam) => {
+export const serializeTeam = (team: ITournamentTeam) => {
   const statistics =
     typeof (team.statistics as any)?.toObject === "function"
       ? (team.statistics as any).toObject()
@@ -1109,6 +1115,8 @@ export const createTournament = async (
     const oversPerMatch = parsePositiveNumber(req.body?.oversPerMatch);
     const format = req.body?.format;
     const squadMode = req.body?.squadMode ?? "teams_only";
+    // New tournaments are shareable by link unless the organizer picks otherwise.
+    const visibility = req.body?.visibility ?? "public";
 
     if (
       !name ||
@@ -1119,7 +1127,8 @@ export const createTournament = async (
       !isBallType(ballType) ||
       !oversPerMatch ||
       !isTournamentFormat(format) ||
-      !isTournamentSquadMode(squadMode)
+      !isTournamentSquadMode(squadMode) ||
+      !isTournamentVisibility(visibility)
     ) {
       res.status(400).json({
         message:
@@ -1153,6 +1162,7 @@ export const createTournament = async (
       oversPerMatch,
       format,
       squadMode,
+      visibility,
       status: "draft",
     });
     const logo = await applyTournamentLogo(tournament, req.body);
@@ -1314,6 +1324,13 @@ export const updateTournament = async (
         return;
       }
       updates.squadMode = req.body.squadMode;
+    }
+    if (req.body?.visibility !== undefined) {
+      if (!isTournamentVisibility(req.body.visibility)) {
+        res.status(400).json({ message: "Tournament visibility must be public, unlisted or private" });
+        return;
+      }
+      updates.visibility = req.body.visibility;
     }
     if (req.body?.ballType !== undefined) {
       if (!isBallType(req.body.ballType)) {

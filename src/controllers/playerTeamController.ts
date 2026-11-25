@@ -501,7 +501,8 @@ export const getPublicPlayers = async (
   try {
     const q = normalizeText(req.query.q);
     const query: Record<string, unknown> = {
-      visibility: { $ne: "hidden" },
+      // Unlisted profiles are reachable by link only, never in lists.
+      visibility: { $nin: ["hidden", "unlisted"] },
       mergedInto: { $exists: false },
     };
     if (q) {

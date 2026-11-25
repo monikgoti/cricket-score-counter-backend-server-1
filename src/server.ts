@@ -17,6 +17,7 @@ import publicPlayerRoutes from "./routes/publicPlayerRoutes";
 import savedMatchRoutes from "./routes/savedMatchRoutes";
 import statsRoutes from "./routes/statsRoutes";
 import tournamentRoutes from "./routes/tournamentRoutes";
+import exploreRoutes from "./routes/exploreRoutes";
 import { SocketIOClientEvents, SocketIOEvents } from "./utils/constant";
 import { setSocketServer } from "./utils/socketState";
 import { Socket, Server as SocketIOServer } from "socket.io";
@@ -323,6 +324,7 @@ app.use("/api/v1/promo-banner", promoBannerRoutes);
 app.use("/api/v1/public-players", publicPlayerRoutes);
 app.use("/api/v1/matches", savedMatchRoutes);
 app.use("/api/v1/tournaments", tournamentRoutes);
+app.use("/api/v1/explore", exploreRoutes);
 app.use("/api/v1/stats", statsRoutes);
 app.use("/api/v1/analytics", analyticsRoutes);
 

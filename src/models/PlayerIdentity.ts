@@ -1,6 +1,12 @@
 import { Schema, model, type Document, type Types } from "mongoose";
 
-export const PLAYER_VISIBILITIES = ["public", "hidden"] as const;
+/**
+ * public   – listed in search/explore; profile and stats open to anyone.
+ * unlisted – not listed anywhere, but anyone with the link (or the exact
+ *            username) can open the profile and stats.
+ * hidden   – only the owner can see the profile and stats.
+ */
+export const PLAYER_VISIBILITIES = ["public", "unlisted", "hidden"] as const;
 export type PlayerVisibility = (typeof PLAYER_VISIBILITIES)[number];
 
 export interface IPlayerIdentity extends Document {

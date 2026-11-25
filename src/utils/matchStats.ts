@@ -48,6 +48,10 @@ export interface BowlingLine {
   maidens: number;
   wides: number;
   noBalls: number;
+  /** Bowler's wickets by dismissal type (bowled, caught, lbw, ...). */
+  wicketTypes?: Record<string, number>;
+  /** Three wickets in three consecutive deliveries by this bowler. */
+  hatTricks?: number;
 }
 
 export interface FieldingLine {
@@ -159,6 +163,8 @@ export const computeInnings = (
   let legalBalls = 0;
   let batterRunsTotal = 0;
   let current: Partnership | null = null;
+  // Consecutive bowler wickets per bowler (any other delivery resets it).
+  const wicketStreak = new Map<string, number>();
 
   const batter = (name: string) => {
     let line = batting.get(name);
@@ -171,7 +177,7 @@ export const computeInnings = (
   const bowler = (name: string) => {
     let line = bowling.get(name);
     if (!line) {
-      line = { name, balls: 0, runs: 0, wickets: 0, dots: 0, maidens: 0, wides: 0, noBalls: 0 };
+      line = { name, balls: 0, runs: 0, wickets: 0, dots: 0, maidens: 0, wides: 0, noBalls: 0, wicketTypes: {}, hatTricks: 0 };
       bowling.set(name, line);
     }
     return line;
@@ -263,7 +269,17 @@ export const computeInnings = (
         }
         if (e.type === "wide") b.wides += 1;
         if (e.type === "no-ball" || e.type === "no-ball-extra" || e.extra_type === "no-ball-extra") b.noBalls += 1;
-        if (isBowlerWicket(e)) b.wickets += 1;
+        if (isBowlerWicket(e)) {
+          b.wickets += 1;
+          const kind = e.wicketType || "bowled";
+          b.wicketTypes = b.wicketTypes ?? {};
+          b.wicketTypes[kind] = (b.wicketTypes[kind] ?? 0) + 1;
+          const streak = (wicketStreak.get(bowlerName) ?? 0) + 1;
+          wicketStreak.set(bowlerName, streak);
+          if (streak === 3) b.hatTricks = (b.hatTricks ?? 0) + 1;
+        } else {
+          wicketStreak.set(bowlerName, 0);
+        }
         const o = perBowlerInOver.get(bowlerName) ?? { legal: 0, conceded: 0 };
         o.conceded += conceded;
         if (legal) o.legal += 1;
@@ -416,7 +432,10 @@ export const getPlayerPerformance = (
     opponent,
     result,
     batting: batting ? { ...batting } : undefined,
-    bowling: bowling && bowling.balls + bowling.wides + bowling.noBalls > 0 ? { ...bowling } : undefined,
+    bowling:
+      bowling && bowling.balls + bowling.wides + bowling.noBalls > 0
+        ? { ...bowling, wicketTypes: { ...(bowling.wicketTypes ?? {}) } }
+        : undefined,
     fielding: { catches: field?.catches ?? 0, runOuts: field?.runOuts ?? 0 },
   };
 };

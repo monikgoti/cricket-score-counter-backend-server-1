@@ -4,11 +4,20 @@ export const TOURNAMENT_FORMATS = ["league", "knockout"] as const;
 export const BALL_TYPES = ["tennis", "leather", "custom"] as const;
 export const TOURNAMENT_STATUSES = ["draft", "active", "completed"] as const;
 export const TOURNAMENT_SQUAD_MODES = ["teams_only", "with_players"] as const;
+/**
+ * public   – listed on the explore page; anyone can view teams, points
+ *            table, matches and stats.
+ * unlisted – anyone with the link can view, but it isn't listed.
+ * private  – only the organizer and the registered players in its squads.
+ *            Its matches are also left out of player stats shown to others.
+ */
+export const TOURNAMENT_VISIBILITIES = ["public", "unlisted", "private"] as const;
 
 export type TournamentFormat = (typeof TOURNAMENT_FORMATS)[number];
 export type BallType = (typeof BALL_TYPES)[number];
 export type TournamentStatus = (typeof TOURNAMENT_STATUSES)[number];
 export type TournamentSquadMode = (typeof TOURNAMENT_SQUAD_MODES)[number];
+export type TournamentVisibility = (typeof TOURNAMENT_VISIBILITIES)[number];
 
 export interface ITournament extends Document {
   organizer: Types.ObjectId;
@@ -27,6 +36,8 @@ export interface ITournament extends Document {
   format: TournamentFormat;
   squadMode: TournamentSquadMode;
   status: TournamentStatus;
+  /** Missing on tournaments created before visibility existed: treat as public. */
+  visibility?: TournamentVisibility;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -98,6 +109,11 @@ const tournamentSchema = new Schema<ITournament>(
       enum: TOURNAMENT_STATUSES,
       default: "draft",
     },
+    visibility: {
+      type: String,
+      enum: TOURNAMENT_VISIBILITIES,
+      default: "public",
+    },
   },
   {
     timestamps: true,
@@ -105,5 +121,6 @@ const tournamentSchema = new Schema<ITournament>(
 );
 
 tournamentSchema.index({ organizer: 1, createdAt: -1 });
+tournamentSchema.index({ visibility: 1, startDate: -1 });
 
 export const Tournament = model<ITournament>("Tournament", tournamentSchema);

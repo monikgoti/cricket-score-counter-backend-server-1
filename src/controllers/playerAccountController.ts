@@ -210,7 +210,15 @@ export const searchPlayers = async (req: AuthenticatedRequest, res: Response) =>
     if (unclaimed) {
       filter.user = { $exists: false };
       filter.suspendedAt = { $exists: false };
-    } else filter.visibility = { $ne: "hidden" };
+    } else {
+      // Unlisted profiles only match their exact username.
+      const exact = q.toLowerCase().replace(/^@/, "");
+      delete filter.$or;
+      filter.$or = [
+        { visibility: { $nin: ["hidden", "unlisted"] }, $or: [{ name: pattern }, { username: pattern }] },
+        { visibility: "unlisted", username: exact },
+      ];
+    }
 
     const players = await PlayerIdentity.find(filter).limit(40).lean();
     players.sort((a, b) => Number(Boolean(b.user)) - Number(Boolean(a.user)) || a.name.localeCompare(b.name));
@@ -279,7 +287,7 @@ export const getRecentPlayers = async (req: AuthenticatedRequest, res: Response)
 
 // ---------------------------------------------------------------- public share page
 
-/** GET /players/public/:username — no login; only for public profiles. */
+/** GET /players/public/:username — no login; public and unlisted profiles. */
 export const getPublicPlayerProfile = async (req: Request, res: Response) => {
   try {
     const username = text(req.params.username, 30).toLowerCase();
@@ -289,12 +297,13 @@ export const getPublicPlayerProfile = async (req: Request, res: Response) => {
       res.status(404).json({ message: "Player not found" });
       return;
     }
-    const career = await computePlayerCareer(player._id as Types.ObjectId);
+    // Anonymous view: private tournaments are left out.
+    const career = await computePlayerCareer(player._id as Types.ObjectId, {});
     res.setHeader("Cache-Control", "public, max-age=300");
     res.status(200).json({
       player: serializePublicPlayer(player),
       overall: career.overall,
-      tournaments: career.tournaments.map((t) => ({ name: t.name, teamName: t.teamName, matches: t.stats.matches, runs: t.stats.batting.runs, wickets: t.stats.bowling.wickets })),
+      tournaments: career.tournaments.map((t) => ({ tournamentId: t.tournamentId, name: t.name, teamName: t.teamName, matches: t.stats.matches, runs: t.stats.batting.runs, wickets: t.stats.bowling.wickets })),
       recentMatches: career.recentMatches.slice(0, 5).map((m) => ({
         date: m.date, team: m.team, opponent: m.opponent, result: m.result,
         tournamentName: m.tournamentName ?? "", batting: m.batting, bowling: m.bowling,
@@ -542,7 +551,7 @@ export const getMyTournaments = async (req: AuthenticatedRequest, res: Response)
     const myTeams = await TournamentTeam.find({ "players.playerId": me._id }).select("name tournament organizer logoUrl").lean();
     const tournamentIds = myTeams.map((t) => t.tournament);
     const [tournaments, allTeams, matches] = await Promise.all([
-      Tournament.find({ _id: { $in: tournamentIds } }).select("name logoUrl status startDate endDate organizerName format").lean(),
+      Tournament.find({ _id: { $in: tournamentIds } }).select("name logoUrl status startDate endDate organizerName format visibility").lean(),
       TournamentTeam.find({ tournament: { $in: tournamentIds } }).select("name tournament").lean(),
       TournamentMatch.find({
         tournament: { $in: tournamentIds },
@@ -567,6 +576,7 @@ export const getMyTournaments = async (req: AuthenticatedRequest, res: Response)
           logoUrl: t.logoUrl ?? "",
           status: t.status,
           format: t.format,
+          visibility: t.visibility ?? "public",
           organizerName: t.organizerName ?? "",
           startDate: t.startDate,
           endDate: t.endDate,
